@@ -167,8 +167,16 @@ void ScheduleReadyWork(Time_t now) {
         // Small cores = 4, 5, 6, 7
         const CPUId_t core = (position + 4) % cores.size();
         if (!ready.Empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready) {
-            const ProcessId_t pid = ready.PopNext();
-            Dispatch(pid, core, now);
+            std::optional<ProcessId_t> pid;
+            if (core < 4) {
+                // High-perf cores. There's no reason to schedule here if time remaining is <= 120
+                // (the amount of work a low-perf core can get done in one time quantum)
+                pid = ready.PopNext(121);
+            } else {
+                pid = ready.PopNext();
+            }
+            if (pid)
+                Dispatch(*pid, core, now);
         }
     }
 

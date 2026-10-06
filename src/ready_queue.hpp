@@ -5,11 +5,13 @@
 
 #include <cstddef>
 #include <deque>
+#include <optional>
 
 class ReadyQueue {
 public:
     void Enqueue(ProcessId_t pid);
     ProcessId_t PopNext();
+    std::optional<ProcessId_t> PopNext(Time_t minimum_remaining);
     bool Empty() const;
     std::size_t Size() const;
 

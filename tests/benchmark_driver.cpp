@@ -20,7 +20,7 @@ extern "C" void __real__Z11LoadContextjj(ProcessId_t, CPUId_t);
 extern "C" void __real__Z11SaveContextjj(ProcessId_t, CPUId_t);
 
 namespace {
-struct Job { Time_t arrival; Time_t work; };
+struct Job { Time_t arrival; Time_t work; bool dispatched = false; };
 std::map<ProcessId_t, Job> live;
 std::array<ProcessId_t, 8> owned;
 std::uint64_t created = 0, completed = 0, work = 0;
@@ -28,6 +28,7 @@ std::uint64_t quantized_floor = 0;
 Time_t maximum_turnaround = 0;
 Time_t first_callback = -1;
 long double turnaround = 0;
+std::array<std::uint64_t, 2> dispatched_jobs{}, dispatched_work{};
 std::string scenario;
 bool expect_optimum = false;
 
@@ -58,6 +59,13 @@ extern "C" void __wrap__Z11LoadContextjj(ProcessId_t pid, CPUId_t core) {
     for (ProcessId_t owner : owned)
         if (owner == pid)
             throw std::runtime_error("Process loaded onto more than one core");
+    Job &job = live.at(pid);
+    if (!job.dispatched) {
+        const std::size_t type = core < 4 ? 0 : 1;
+        ++dispatched_jobs[type];
+        dispatched_work[type] += job.work;
+        job.dispatched = true;
+    }
     __real__Z11LoadContextjj(pid, core);
     owned[core] = pid;
 }
@@ -164,7 +172,9 @@ void SimulationComplete(Time_t now) {
               << ",\"quantized_floor\":" << quantized_floor
               << ",\"startup_floor\":" << startup_floor
               << ",\"mean_turnaround\":" << (created ? turnaround / created : 0)
-              << ",\"max_turnaround\":" << maximum_turnaround << "}\n";
+              << ",\"max_turnaround\":" << maximum_turnaround
+              << ",\"high_jobs\":" << dispatched_jobs[0] << ",\"low_jobs\":" << dispatched_jobs[1]
+              << ",\"high_work\":" << dispatched_work[0] << ",\"low_work\":" << dispatched_work[1] << "}\n";
 }
 
 int main(int argc, char **argv) {
@@ -197,6 +207,14 @@ int main(int argc, char **argv) {
         } else if (scenario == "zero") {
             AddProcess(0, 0);
             AddProcess(0, 1);
+        } else if (scenario == "equal") {
+            for (unsigned i = 0; i < 64; ++i)
+                AddProcess(i * 10, 15);
+        } else if (scenario == "extrema") {
+            for (unsigned i = 0; i < 20; ++i) {
+                AddProcess(i * 100, 20 - i);
+                AddProcess(i * 100 + 1, 20 + i);
+            }
         } else {
             throw std::runtime_error("Unknown benchmark scenario");
         }

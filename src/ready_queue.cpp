@@ -23,19 +23,6 @@ ProcessId_t ReadyQueue::PopNext() {
     return pid;
 }
 
-std::optional<ProcessId_t> ReadyQueue::PopNext(Time_t minimum_remaining) {
-    const auto position = std::find_if(processes.begin(), processes.end(),
-                                      [minimum_remaining](ProcessId_t pid) {
-        return GetRemaining(pid) >= minimum_remaining;
-    });
-    if (position == processes.end())
-        return std::nullopt;
-
-    const ProcessId_t pid = *position;
-    processes.erase(position);
-    return pid;
-}
-
 bool ReadyQueue::Empty() const {
     return processes.empty();
 }

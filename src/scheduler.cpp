@@ -1,18 +1,12 @@
-// Energy-first scheduler for the supplied eight-core simulator.
+// Percentile-based probabilistic placement for the eight-core simulator.
 #include "scheduler.hpp"
 #include "ready_queue.hpp"
+#include "job_placement.hpp"
 
 #include <array>
 #include <iomanip>
 #include <optional>
 #include <unordered_map>
-
-/*
- * Ideas:
- * 1. Intelligently choose between big and small cores. Big cores for more work unit jobs, small cores otherwise
- * 3. Adaptive idle control instead of always going to C6 for sleep. Look into methods to predict job arrivals
- * 4. Adjust Pstate based on IO bound operations
- */
 
 // Compile-time controls allow paired benchmarks without changing the workload.
 #ifndef EEC_SMALL_CORES
@@ -50,12 +44,31 @@ struct CoreRecord {
 
 struct ProcessRecord {
     Time_t arrival;
+    bool high;
     bool dispatched = false;
     std::optional<CPUId_t> core;
 };
 
+struct QueueMetrics {
+    std::uint64_t admitted = 0, completed = 0, work = 0;
+    std::size_t maximum_depth = 0;
+    Time_t maximum_wait = 0, maximum_turnaround = 0;
+    long double wait = 0, turnaround = 0;
+    std::uint64_t wake_requests = 0, wake_completions = 0;
+};
+
+struct BandMetrics {
+    std::uint64_t jobs = 0, high_jobs = 0;
+    double expected_high_jobs = 0;
+};
+
 std::array<CoreRecord, 8> cores;
-ReadyQueue ready;
+ReadyQueue high_ready, low_ready;
+WorkDistribution distribution;
+PlacementPolicy placement;
+// High type is index 0; low type is index 1.
+std::array<QueueMetrics, 2> queue_metrics;
+std::array<BandMetrics, 4> band_metrics;
 std::unordered_map<ProcessId_t, ProcessRecord> processes;
 bool initialized = false;
 std::uint64_t created = 0;
@@ -66,6 +79,10 @@ std::uint64_t wake_completions = 0;
 std::uint64_t tail_changes = 0;
 Time_t total_wait = 0;
 Time_t maximum_wait = 0;
+
+ReadyQueue &QueueForCore(CPUId_t core) {
+    return core < 4 ? high_ready : low_ready;
+}
 
 // Inputs: core ID. Output: none. Postcondition: a ready core enters its
 // configured idle state (enabled) or C6 (disabled); other cores are unchanged.
@@ -85,6 +102,7 @@ void SleepCore(CPUId_t core) {
 void Initialize() {
     if (initialized)
         return;
+    placement = PlacementPolicy::FromEnvironment();
     initialized = true;
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         cores[core].pid = InvalidProcessId();
@@ -128,11 +146,15 @@ void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
         // unable to resolve pid in processes map
         ThrowException("Dispatch received an unknown process");
     ProcessRecord &process_record = process_entry->second;
+    if (process_record.high != (core < 4) || !record.enabled)
+        ThrowException("Dispatch does not match the assigned queue's core type");
 
     // Count the process's ready-queue wait once, on its first dispatch.
-    // Keep track of total weight/max weight for metrics printed upon exit
     if (!process_record.dispatched) {
         const Time_t wait = now - process_record.arrival;
+        QueueMetrics &metrics = queue_metrics[process_record.high ? 0 : 1];
+        metrics.wait += wait;
+        metrics.maximum_wait = std::max(metrics.maximum_wait, wait);
         total_wait += wait;
         if (wait > maximum_wait)
             maximum_wait = wait;
@@ -160,42 +182,29 @@ void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
 // available enabled cores; additional required cores are requested awake, and
 // unused ready cores are put into their configured idle states.
 void ScheduleReadyWork(Time_t now) {
-    // Prefer ready small cores before experimental big-core configurations.
-    for (unsigned position = 0; position < cores.size(); ++position) {
-        // visits cores in this order as position goes from 0 to 7:
-        // 4, 5, 6, 7, 0, 1, 2, 3
-        // Small cores = 4, 5, 6, 7
-        const CPUId_t core = (position + 4) % cores.size();
-        if (!ready.Empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready) {
-            std::optional<ProcessId_t> pid;
-            if (core < 4) {
-                // High-perf cores. There's no reason to schedule here if time remaining is <= 120
-                // (the amount of work a low-perf core can get done in one time quantum)
-                pid = ready.PopNext(121);
-            } else {
-                pid = ready.PopNext();
-            }
-            if (pid)
-                Dispatch(*pid, core, now);
-        }
+    for (CPUId_t core = 0; core < cores.size(); ++core) {
+        ReadyQueue &ready = QueueForCore(core);
+        if (!ready.Empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready)
+            Dispatch(ready.PopNext(), core, now);
     }
 
-    // Are there any cores in the process of waking up?
-    std::size_t waking = 0;
-    for (const CoreRecord &record : cores)
-        if (record.status == CoreStatus::Waking)
-            ++waking;
+    // Pending wakes supply capacity only for their own queue.
+    std::array<std::size_t, 2> waking{};
+    for (CPUId_t core = 0; core < cores.size(); ++core)
+        if (cores[core].status == CoreStatus::Waking)
+            ++waking[core < 4 ? 0 : 1];
 
-    // while we are not out of cores to check and there are still more threads than ready cores
-    for (unsigned position = 0; position < cores.size() && waking < ready.Size(); ++position) {
-        const CPUId_t core = (position + 4) % cores.size();
-        if (cores[core].enabled && cores[core].status == CoreStatus::Sleeping) {
+    for (CPUId_t core = 0; core < cores.size(); ++core) {
+        const std::size_t type = core < 4 ? 0 : 1;
+        if (waking[type] < QueueForCore(core).Size() &&
+            cores[core].enabled && cores[core].status == CoreStatus::Sleeping) {
             // A waking core is counted as future capacity. Never reissue this
             // request: the simulator would restart its transition countdown.
             cores[core].status = CoreStatus::Waking;
             ++wake_requests;
+            ++queue_metrics[type].wake_requests;
             SetCState(core, C1);
-            ++waking; // count moving from C6 (idle) to C1 as waking up
+            ++waking[type];
         }
     }
 
@@ -211,11 +220,23 @@ void CreateProcess(ProcessId_t pid) {
     Initialize();
     const Time_t work = GetRemaining(pid);
     const Time_t now = Now();
-    if (work < 0 || !processes.emplace(pid, ProcessRecord{now, false, std::nullopt}).second)
+    if (work < 0 || processes.count(pid))
         ThrowException("Invalid or duplicate process creation");
+    const auto decision = placement.Admit(work, distribution, EEC_BIG_CORES > 0,
+                                         EEC_SMALL_CORES > 0);
+    processes.emplace(pid, ProcessRecord{now, decision.high, false, std::nullopt});
     ++created;
     initial_work += static_cast<std::uint64_t>(work);
+    ReadyQueue &ready = decision.high ? high_ready : low_ready;
     ready.Enqueue(pid);
+    QueueMetrics &metrics = queue_metrics[decision.high ? 0 : 1];
+    ++metrics.admitted;
+    metrics.work += static_cast<std::uint64_t>(work);
+    metrics.maximum_depth = std::max(metrics.maximum_depth, ready.Size());
+    const auto band = std::min(static_cast<std::size_t>(decision.percentile * 4), std::size_t{3});
+    ++band_metrics[band].jobs;
+    band_metrics[band].high_jobs += decision.high;
+    band_metrics[band].expected_high_jobs += decision.high_probability;
     ScheduleReadyWork(now);
 }
 
@@ -230,6 +251,11 @@ void ExitProcess(ProcessId_t pid) {
     if (owner >= cores.size() || cores[owner].status != CoreStatus::Running ||
         cores[owner].pid != pid || GetRemaining(pid) != 0)
         ThrowException("Completion does not match a running process");
+    QueueMetrics &metrics = queue_metrics[process->second.high ? 0 : 1];
+    const Time_t turnaround = Now() - process->second.arrival;
+    ++metrics.completed;
+    metrics.turnaround += turnaround;
+    metrics.maximum_turnaround = std::max(metrics.maximum_turnaround, turnaround);
     processes.erase(process);
 
     // BeforeScheduler has already detached this completed PID and set C1.
@@ -272,6 +298,7 @@ void CStateTransitionComplete(CPUId_t core) {
         ThrowException("Unexpected C-state transition completion");
     cores[core].status = CoreStatus::Ready;
     ++wake_completions;
+    ++queue_metrics[core < 4 ? 0 : 1].wake_completions;
     // Only dispatch queue entries here; other running cores may not yet have
     // advanced through their BeforeScheduler calls for this timestamp.
     ScheduleReadyWork(Now());
@@ -281,8 +308,12 @@ void CStateTransitionComplete(CPUId_t core) {
 // on stdout. Postcondition: verifies all jobs and contexts are finished before
 // reporting; unfinished or owned work raises an exception.
 void SimulationComplete(Time_t now) {
-    if (!ready.Empty() || !processes.empty() || created != completed)
+    if (!high_ready.Empty() || !low_ready.Empty() || !processes.empty() || created != completed ||
+        distribution.Count() != created)
         ThrowException("Simulation stopped with unfinished scheduler work");
+    for (const QueueMetrics &metrics : queue_metrics)
+        if (metrics.admitted != metrics.completed)
+            ThrowException("Simulation stopped with unfinished queue assignments");
     for (const CoreRecord &record : cores)
         if (record.status == CoreStatus::Running || record.pid != InvalidProcessId())
             ThrowException("Simulation stopped with an owned CPU context");
@@ -301,4 +332,48 @@ void SimulationComplete(Time_t now) {
               << "Active-energy lower bound: " << lower_bound
               << "; overhead: " << (lower_bound ? 100.0 * (energy / lower_bound - 1.0) : 0.0)
               << "%\n";
+
+    // One machine-readable record per run, alongside the existing energy report.
+    std::cout << "PLACEMENT {\"seed\":" << placement.Seed() << ",\"probabilities\":[";
+    for (std::size_t i = 0; i < placement.Probabilities().size(); ++i)
+        std::cout << (i ? "," : "") << placement.Probabilities()[i];
+    std::cout << "],\"big_cores\":" << EEC_BIG_CORES
+              << ",\"small_cores\":" << EEC_SMALL_CORES
+              << ",\"pstate\":" << EEC_PSTATE << ",\"idle_state\":" << EEC_IDLE_STATE
+              << ",\"tail_dvfs\":" << EEC_TAIL_DVFS
+              << ",\"samples\":" << distribution.Count() << ",\"work_distribution\":{";
+    const std::array<const char *, 5> names = {"min", "p25", "median", "p75", "max"};
+    const auto summary = distribution.Summary();
+    for (std::size_t i = 0; i < names.size(); ++i) {
+        std::cout << (i ? "," : "") << '"' << names[i] << "\":";
+        if (summary)
+            std::cout << (*summary)[i];
+        else
+            std::cout << "null";
+    }
+    std::cout << '}';
+    for (std::size_t type = 0; type < queue_metrics.size(); ++type) {
+        const QueueMetrics &metrics = queue_metrics[type];
+        std::cout << ",\"" << (type == 0 ? "high" : "low") << "\":{\"jobs\":" << metrics.admitted
+                  << ",\"completed\":" << metrics.completed << ",\"work\":" << metrics.work
+                  << ",\"max_depth\":" << metrics.maximum_depth
+                  << ",\"mean_wait\":" << (metrics.admitted ? metrics.wait / metrics.admitted : 0)
+                  << ",\"max_wait\":" << metrics.maximum_wait
+                  << ",\"mean_turnaround\":" << (metrics.admitted ? metrics.turnaround / metrics.admitted : 0)
+                  << ",\"max_turnaround\":" << metrics.maximum_turnaround
+                  << ",\"wake_requests\":" << metrics.wake_requests
+                  << ",\"wake_completions\":" << metrics.wake_completions << '}';
+    }
+    std::cout << ",\"bands\":[";
+    for (std::size_t i = 0; i < band_metrics.size(); ++i) {
+        const BandMetrics &band = band_metrics[i];
+        std::cout << (i ? "," : "") << "{\"lower\":" << i / 4.0
+                  << ",\"upper\":" << (i + 1) / 4.0 << ",\"jobs\":" << band.jobs
+                  << ",\"high_jobs\":" << band.high_jobs
+                  << ",\"expected_high_jobs\":" << band.expected_high_jobs
+                  << ",\"expected_high_fraction\":" << (band.jobs ? band.expected_high_jobs / band.jobs : 0)
+                  << ",\"observed_high_fraction\":" << (band.jobs ? static_cast<double>(band.high_jobs) / band.jobs : 0)
+                  << '}';
+    }
+    std::cout << "]}\n";
 }

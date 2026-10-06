@@ -1,0 +1,69 @@
+{
+  "date": "2026-10-05",
+  "scheduler_sha256": "c50031cd8b54a9375ddbd42928aec5133a5cfabdf2c94b99e4293d2600433d35",
+  "clock_units": "raw simulator clock",
+  "experiments": [
+    {
+      "scenario": "single",
+      "policy": "C6",
+      "work": 1000,
+      "arrival": 0,
+      "dispatch": 2000000,
+      "exit": 2005000,
+      "energy": 13000
+    },
+    {
+      "scenario": "single",
+      "policy": "C4",
+      "work": 1000,
+      "arrival": 0,
+      "dispatch": 10000,
+      "exit": 15000,
+      "energy": 57000
+    },
+    {
+      "scenario": "single",
+      "policy": "C1",
+      "work": 1000,
+      "arrival": 0,
+      "dispatch": 0,
+      "exit": 5000,
+      "energy": 85000
+    },
+    {
+      "scenario": "hol",
+      "policy": "C6",
+      "long_jobs": 4,
+      "work_per_long_job": 10000000,
+      "long_arrival": 0,
+      "long_dispatch": 2000000,
+      "long_exit": 43667000,
+      "short_work": 1000,
+      "short_arrival": 3000000,
+      "short_dispatch": 43667000,
+      "short_exit": 43672000,
+      "short_wait": 40667000,
+      "energy": 466683400,
+      "quantized_floor": 466683400,
+      "completed": 5
+    },
+    {
+      "scenario": "gaps",
+      "policy": "C6",
+      "completed": 12,
+      "mean_dispatch_wait": 1999083.33333,
+      "mean_turnaround": 2016083.3333333333,
+      "wakes": 12,
+      "energy": 567200
+    },
+    {
+      "scenario": "seed:0",
+      "policy": "C6",
+      "completed": 6666,
+      "mean_dispatch_wait": 15805189.0189,
+      "max_dispatch_wait": 29824000,
+      "mean_turnaround": 15866152.865286529,
+      "energy": 1135116600
+    }
+  ]
+}

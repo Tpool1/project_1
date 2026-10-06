@@ -7,6 +7,13 @@
 #include <optional>
 #include <unordered_map>
 
+/*
+ * Ideas:
+ * 1. Intelligently choose between big and small cores. Big cores for more work unit jobs, small cores otherwise
+ * 2. Dispatch available work before sleeping cores to C6 to avoid initial wake delay
+ * 3. Adaptive idle control instead of always going to C6 for sleep. Look into methods to predict job arrivals
+ */
+
 // Compile-time controls allow paired benchmarks without changing the workload.
 #ifndef EEC_SMALL_CORES
 #define EEC_SMALL_CORES 4 // Number of small cores (IDs 4-7) enabled for work.

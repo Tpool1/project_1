@@ -4,23 +4,24 @@
 #include <array>
 #include <deque>
 #include <iomanip>
+#include <optional>
 #include <unordered_map>
 
 // Compile-time controls allow paired benchmarks without changing the workload.
 #ifndef EEC_SMALL_CORES
-#define EEC_SMALL_CORES 4
+#define EEC_SMALL_CORES 4 // Number of small cores (IDs 4-7) enabled for work.
 #endif
 #ifndef EEC_BIG_CORES
-#define EEC_BIG_CORES 0
+#define EEC_BIG_CORES 3 // Number of big cores (IDs 0-3) enabled for work.
 #endif
 #ifndef EEC_PSTATE
-#define EEC_PSTATE P3
+#define EEC_PSTATE P3 // P-state used for normal execution.
 #endif
 #ifndef EEC_IDLE_STATE
-#define EEC_IDLE_STATE C6
+#define EEC_IDLE_STATE C4 // Idle C-state for enabled cores; disabled cores use C6.
 #endif
 #ifndef EEC_TAIL_DVFS
-#define EEC_TAIL_DVFS 1
+#define EEC_TAIL_DVFS 1 // Enable P3-to-P4 switching when a job can finish in one quantum.
 #endif
 
 static_assert(EEC_SMALL_CORES >= 0 && EEC_SMALL_CORES <= 4, "Invalid small-core count");
@@ -43,6 +44,7 @@ struct CoreRecord {
 struct ProcessRecord {
     Time_t arrival;
     bool dispatched = false;
+    std::optional<CPUId_t> core;
 };
 
 std::array<CoreRecord, 8> cores;
@@ -58,6 +60,8 @@ std::uint64_t tail_changes = 0;
 Time_t total_wait = 0;
 Time_t maximum_wait = 0;
 
+// Inputs: core ID. Output: none. Postcondition: a ready core enters its
+// configured idle state (enabled) or C6 (disabled); other cores are unchanged.
 void SleepCore(CPUId_t core) {
     CoreRecord &record = cores[core];
     if (record.status != CoreStatus::Ready)
@@ -69,12 +73,15 @@ void SleepCore(CPUId_t core) {
     }
 }
 
+// Inputs: none. Output: none. Postcondition: core ownership and enabled flags
+// are initialized once, and every ready core is placed in its idle state.
 void Initialize() {
     if (initialized)
         return;
     initialized = true;
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         cores[core].pid = InvalidProcessId();
+        // enable the core ids according to the simulator
         cores[core].enabled = static_cast<int>(core) < EEC_BIG_CORES ||
                               (core >= 4 && core < 4 + EEC_SMALL_CORES);
         // Constructors establish C1. Sleeping before requesting work also
@@ -83,59 +90,90 @@ void Initialize() {
     }
 }
 
+// Inputs: core ID and remaining work. Output: selected P-state. Postcondition:
+// scheduler state is unchanged; a short final interval may select P4.
 PState_t StateForWork(CPUId_t core, Time_t remaining) {
-    if (EEC_TAIL_DVFS && EEC_PSTATE == P3) {
-        // At a timer boundary, P4 completes <=120 small-core work units
+    if (EEC_TAIL_DVFS) {
+        // At a timer interrupt, P4 completes <=120 small-core work units
         // (<=200 on a big core) in one quantum for less energy than P3.
-        const Time_t p4_work_per_quantum = core >= 4 ? QUANTUM * 12 / 100 : QUANTUM / 5;
+        // These thresholds come from libsim.so: CPU::BeforeScheduler applies
+        // speed[P4] * scale[core type] * elapsed, with P4 speed 0.20, big
+        // scale 1.0, and small scale 0.60. For QUANTUM=1000 (sim_types.h),
+        // that is 200 work units on a big core and 120 on a small core.
+        const Time_t p4_work_per_quantum = core >= 4 ? 120 : 200;
         if (remaining > 0 && remaining <= p4_work_per_quantum)
             return P4;
     }
     return EEC_PSTATE;
 }
 
-void Dispatch(ProcessId_t pid, CPUId_t core) {
+// Inputs: process ID, ready core ID, and current time. Output: none.
+// Postcondition: the process context runs on that core at its selected
+// P-state, and first-dispatch wait is recorded when applicable.
+void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
+    // Verify the target core is ready and not already assigned to a process.
     CoreRecord &record = cores[core];
     if (record.status != CoreStatus::Ready || record.pid != InvalidProcessId())
         ThrowException("Dispatch requires an unowned core in C1");
-    auto process = processes.find(pid);
-    if (process == processes.end())
-        ThrowException("Dispatch received an unknown process");
 
-    if (!process->second.dispatched) {
-        const Time_t wait = Now() - process->second.arrival;
+    // Look up the process record and reject IDs that were never created.
+    auto process_entry = processes.find(pid);
+    if (process_entry == processes.end())
+        // unable to resolve pid in processes map
+        ThrowException("Dispatch received an unknown process");
+    ProcessRecord &process_record = process_entry->second;
+
+    // Count the process's ready-queue wait once, on its first dispatch.
+    // Keep track of total weight/max weight for metrics printed upon exit
+    if (!process_record.dispatched) {
+        const Time_t wait = now - process_record.arrival;
         total_wait += wait;
         if (wait > maximum_wait)
             maximum_wait = wait;
-        process->second.dispatched = true;
+        process_record.dispatched = true;
     }
+
+    // Choose a P-state based on the core type and the process's remaining work.
     const PState_t state = StateForWork(core, GetRemaining(pid));
+
+    // Load the saved process context, then start execution on the core.
     LoadContext(pid, core);
     RunCore(core);
     // RunCore resets the execution timestamp. No work is double-counted
     // when SetPState is applied immediately afterward at the same time.
+
+    // Apply the selected P-state and record the core's new ownership and state.
     SetPState(core, state);
     record.pid = pid;
     record.pstate = state;
     record.status = CoreStatus::Running;
+    process_record.core = core;
 }
 
-void ScheduleReadyWork() {
+// Inputs: current time. Output: none. Postcondition: queued work is dispatched to
+// available enabled cores; additional required cores are requested awake, and
+// unused ready cores are put into their configured idle states.
+void ScheduleReadyWork(Time_t now) {
     // Prefer ready small cores before experimental big-core configurations.
     for (unsigned position = 0; position < cores.size(); ++position) {
+        // visits cores in this order as position goes from 0 to 7:
+        // 4, 5, 6, 7, 0, 1, 2, 3
+        // Small cores = 4, 5, 6, 7
         const CPUId_t core = (position + 4) % cores.size();
         if (!ready.empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready) {
             const ProcessId_t pid = ready.front();
             ready.pop_front();
-            Dispatch(pid, core);
+            Dispatch(pid, core, now);
         }
     }
 
+    // Are there any cores in the process of waking up?
     std::size_t waking = 0;
     for (const CoreRecord &record : cores)
         if (record.status == CoreStatus::Waking)
             ++waking;
 
+    // while we are not out of cores to check and there are still more threads than ready cores
     for (unsigned position = 0; position < cores.size() && waking < ready.size(); ++position) {
         const CPUId_t core = (position + 4) % cores.size();
         if (cores[core].enabled && cores[core].status == CoreStatus::Sleeping) {
@@ -144,54 +182,64 @@ void ScheduleReadyWork() {
             cores[core].status = CoreStatus::Waking;
             ++wake_requests;
             SetCState(core, C1);
-            ++waking;
+            ++waking; // count moving from C6 (idle) to C1 as waking up
         }
     }
 
+    // Put unused (ready) cores to sleep
     for (CPUId_t core = 0; core < cores.size(); ++core)
         SleepCore(core);
 }
 } // namespace
 
+// Inputs: newly created process ID. Output: none. Postcondition: the process
+// is recorded, counted, queued, and scheduled if capacity is available.
 void CreateProcess(ProcessId_t pid) {
     Initialize();
     const Time_t work = GetRemaining(pid);
-    if (work < 0 || !processes.emplace(pid, ProcessRecord{Now()}).second)
+    const Time_t now = Now();
+    if (work < 0 || !processes.emplace(pid, ProcessRecord{now}).second)
         ThrowException("Invalid or duplicate process creation");
     ++created;
     initial_work += static_cast<std::uint64_t>(work);
     ready.push_back(pid);
-    ScheduleReadyWork();
+    ScheduleReadyWork(now);
 }
 
+// Inputs: completed process ID. Output: none. Postcondition: a validated
+// completed process is removed, its core is released, and queued work is
+// scheduled; invalid completion state raises an exception.
 void ExitProcess(ProcessId_t pid) {
-    CPUId_t owner = static_cast<CPUId_t>(cores.size());
-    for (CPUId_t core = 0; core < cores.size(); ++core)
-        if (cores[core].status == CoreStatus::Running && cores[core].pid == pid)
-            owner = core;
-    if (owner == cores.size() || GetRemaining(pid) != 0 || processes.erase(pid) != 1)
+    auto process = processes.find(pid);
+    if (process == processes.end() || !process->second.core)
         ThrowException("Completion does not match a running process");
+    const CPUId_t owner = *process->second.core;
+    if (owner >= cores.size() || cores[owner].status != CoreStatus::Running ||
+        cores[owner].pid != pid || GetRemaining(pid) != 0)
+        ThrowException("Completion does not match a running process");
+    processes.erase(process);
 
     // BeforeScheduler has already detached this completed PID and set C1.
     // SaveContext here would incorrectly require a still-running C0 core.
     cores[owner].pid = InvalidProcessId();
     cores[owner].status = CoreStatus::Ready;
     ++completed;
-    ScheduleReadyWork();
+    ScheduleReadyWork(Now());
 }
 
-void TimerInterrupt(Time_t /* now */) {
+// Inputs: timer timestamp.
+// Output: none. Postcondition: eligible running jobs use the appropriate
+// final-interval P-state, then ready work is scheduled.
+void TimerInterrupt(Time_t now) {
     Initialize();
-    if (EEC_TAIL_DVFS && EEC_PSTATE == P3) {
+    if (EEC_TAIL_DVFS) {
         for (CPUId_t core = 0; core < cores.size(); ++core) {
             CoreRecord &record = cores[core];
             if (record.status != CoreStatus::Running)
                 continue;
             const PState_t state = StateForWork(core, GetRemaining(record.pid));
             if (state != record.pstate) {
-                // BeforeScheduler already accounted for this quantum, but
-                // AfterScheduler has not yet reset the execution timestamp.
-                // A direct SetPState would subtract that work a second time.
+                // Reset the run timestamp so SetPState won't account this quantum twice.
                 SaveContext(record.pid, core);
                 LoadContext(record.pid, core);
                 RunCore(core);
@@ -201,9 +249,11 @@ void TimerInterrupt(Time_t /* now */) {
             }
         }
     }
-    ScheduleReadyWork();
+    ScheduleReadyWork(now);
 }
 
+// Inputs: core ID whose wake transition completed. Output: none. Postcondition:
+// the validated waking core becomes ready and queued work is rescheduled.
 void CStateTransitionComplete(CPUId_t core) {
     if (core >= cores.size() || cores[core].status != CoreStatus::Waking)
         ThrowException("Unexpected C-state transition completion");
@@ -211,9 +261,12 @@ void CStateTransitionComplete(CPUId_t core) {
     ++wake_completions;
     // Only dispatch queue entries here; other running cores may not yet have
     // advanced through their BeforeScheduler calls for this timestamp.
-    ScheduleReadyWork();
+    ScheduleReadyWork(Now());
 }
 
+// Inputs: final simulation timestamp. Output: completion and energy metrics
+// on stdout. Postcondition: verifies all jobs and contexts are finished before
+// reporting; unfinished or owned work raises an exception.
 void SimulationComplete(Time_t now) {
     if (!ready.empty() || !processes.empty() || created != completed)
         ThrowException("Simulation stopped with unfinished scheduler work");

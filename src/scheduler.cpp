@@ -1,8 +1,8 @@
 // Energy-first scheduler for the supplied eight-core simulator.
 #include "scheduler.hpp"
+#include "ready_queue.hpp"
 
 #include <array>
-#include <deque>
 #include <iomanip>
 #include <optional>
 #include <unordered_map>
@@ -12,6 +12,7 @@
  * 1. Intelligently choose between big and small cores. Big cores for more work unit jobs, small cores otherwise
  * 2. Dispatch available work before sleeping cores to C6 to avoid initial wake delay
  * 3. Adaptive idle control instead of always going to C6 for sleep. Look into methods to predict job arrivals
+ * 4. Adjust Pstate based on IO bound operations
  */
 
 // Compile-time controls allow paired benchmarks without changing the workload.
@@ -55,7 +56,7 @@ struct ProcessRecord {
 };
 
 std::array<CoreRecord, 8> cores;
-std::deque<ProcessId_t> ready;
+ReadyQueue ready;
 std::unordered_map<ProcessId_t, ProcessRecord> processes;
 bool initialized = false;
 std::uint64_t created = 0;
@@ -167,9 +168,8 @@ void ScheduleReadyWork(Time_t now) {
         // 4, 5, 6, 7, 0, 1, 2, 3
         // Small cores = 4, 5, 6, 7
         const CPUId_t core = (position + 4) % cores.size();
-        if (!ready.empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready) {
-            const ProcessId_t pid = ready.front();
-            ready.pop_front();
+        if (!ready.Empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready) {
+            const ProcessId_t pid = ready.PopNext();
             Dispatch(pid, core, now);
         }
     }
@@ -181,7 +181,7 @@ void ScheduleReadyWork(Time_t now) {
             ++waking;
 
     // while we are not out of cores to check and there are still more threads than ready cores
-    for (unsigned position = 0; position < cores.size() && waking < ready.size(); ++position) {
+    for (unsigned position = 0; position < cores.size() && waking < ready.Size(); ++position) {
         const CPUId_t core = (position + 4) % cores.size();
         if (cores[core].enabled && cores[core].status == CoreStatus::Sleeping) {
             // A waking core is counted as future capacity. Never reissue this
@@ -205,11 +205,11 @@ void CreateProcess(ProcessId_t pid) {
     Initialize();
     const Time_t work = GetRemaining(pid);
     const Time_t now = Now();
-    if (work < 0 || !processes.emplace(pid, ProcessRecord{now}).second)
+    if (work < 0 || !processes.emplace(pid, ProcessRecord{now, false, std::nullopt}).second)
         ThrowException("Invalid or duplicate process creation");
     ++created;
     initial_work += static_cast<std::uint64_t>(work);
-    ready.push_back(pid);
+    ready.Enqueue(pid);
     ScheduleReadyWork(now);
 }
 
@@ -275,7 +275,7 @@ void CStateTransitionComplete(CPUId_t core) {
 // on stdout. Postcondition: verifies all jobs and contexts are finished before
 // reporting; unfinished or owned work raises an exception.
 void SimulationComplete(Time_t now) {
-    if (!ready.empty() || !processes.empty() || created != completed)
+    if (!ready.Empty() || !processes.empty() || created != completed)
         ThrowException("Simulation stopped with unfinished scheduler work");
     for (const CoreRecord &record : cores)
         if (record.status == CoreStatus::Running || record.pid != InvalidProcessId())

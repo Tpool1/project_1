@@ -3,7 +3,7 @@
 set -eu
 project_dir=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
 benchmark_dir=$(mktemp -d "${TMPDIR:-/tmp}/eec-scheduler-benchmark.XXXXXX")
-trap 'rm -f "$benchmark_dir/driver.o" "$benchmark_dir/policy.o" "$benchmark_dir/benchmark"; rmdir "$benchmark_dir"' EXIT HUP INT TERM
+trap 'rm -f "$benchmark_dir/driver.o" "$benchmark_dir/policy.o" "$benchmark_dir/ready_queue.o" "$benchmark_dir/benchmark"; rmdir "$benchmark_dir"' EXIT HUP INT TERM
 compiler=${CXX:-g++}
 renames='-DCreateProcess=PolicyCreateProcess -DExitProcess=PolicyExitProcess -DTimerInterrupt=PolicyTimerInterrupt -DCStateTransitionComplete=PolicyCStateTransitionComplete -DSimulationComplete=PolicySimulationComplete'
 mode=${1:---check}
@@ -23,7 +23,9 @@ build_policy() {
     shift 2
     "$compiler" -std=gnu++17 -O2 -Wall -Wextra -Werror -I"$project_dir/src" $renames "$@" \
         -c "$policy_source" -o "$benchmark_dir/policy.o"
-    "$compiler" "$benchmark_dir/driver.o" "$benchmark_dir/policy.o" \
+    "$compiler" -std=gnu++17 -O2 -Wall -Wextra -Werror -I"$project_dir/src" \
+        -c "$project_dir/src/ready_queue.cpp" -o "$benchmark_dir/ready_queue.o"
+    "$compiler" "$benchmark_dir/driver.o" "$benchmark_dir/policy.o" "$benchmark_dir/ready_queue.o" \
         -L"$project_dir/src" -lsim -Wl,-rpath,"$project_dir/src" \
         -Wl,--wrap=_Z11LoadContextjj -Wl,--wrap=_Z11SaveContextjj -o "$benchmark_dir/benchmark"
     printf 'POLICY %s\n' "$policy_name"

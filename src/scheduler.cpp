@@ -10,7 +10,6 @@
 /*
  * Ideas:
  * 1. Intelligently choose between big and small cores. Big cores for more work unit jobs, small cores otherwise
- * 2. Dispatch available work before sleeping cores to C6 to avoid initial wake delay
  * 3. Adaptive idle control instead of always going to C6 for sleep. Look into methods to predict job arrivals
  * 4. Adjust Pstate based on IO bound operations
  */
@@ -82,7 +81,7 @@ void SleepCore(CPUId_t core) {
 }
 
 // Inputs: none. Output: none. Postcondition: core ownership and enabled flags
-// are initialized once, and every ready core is placed in its idle state.
+// are initialized once, leaving cores ready for the first scheduling pass.
 void Initialize() {
     if (initialized)
         return;
@@ -92,9 +91,8 @@ void Initialize() {
         // enable the core ids according to the simulator
         cores[core].enabled = static_cast<int>(core) < EEC_BIG_CORES ||
                               (core >= 4 && core < 4 + EEC_SMALL_CORES);
-        // Constructors establish C1. Sleeping before requesting work also
-        // avoids charging warm-spare power during the first wake interval.
-        SleepCore(core);
+        // Constructors establish C1. ScheduleReadyWork dispatches admitted
+        // work before putting unused cores into their configured idle states.
     }
 }
 

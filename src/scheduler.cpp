@@ -288,12 +288,14 @@ void SimulationComplete(Time_t now) {
             ThrowException("Simulation stopped with an owned CPU context");
 
     const double energy = GetTotalEnergyConsumed();
+    const double edp = energy * static_cast<double>(now);
     const double lower_bound = static_cast<double>(initial_work) * (35.0 / 3.0);
     std::cout << std::setprecision(12)
               << "Run stopped at " << FormatTime(now) << " after consuming "
               << energy / 3600000000.0 << " kWh\n"
               << "Raw time: " << now << "; raw energy: " << energy
               << "; completed: " << completed << '/' << created << '\n'
+              << "EDP (raw energy × raw time): " << edp << '\n'
               << "Mean/max dispatch wait (raw time): "
               << (created ? static_cast<double>(total_wait) / created : 0.0)
               << '/' << maximum_wait << "; wakes: " << wake_completions << '/' << wake_requests

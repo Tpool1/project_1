@@ -60,6 +60,7 @@ int main() {
         const std::string expected_output =
             "Run stopped at formatted-time after consuming 1 kWh\n"
             "Raw time: 456; raw energy: 3600000000; completed: 2/2\n"
+            "EDP (raw energy × raw time): 1641600000000\n"
             "Mean/max dispatch wait (raw time): 50/100; wakes: 3/3; tail P-state changes: 1\n"
             "Active-energy lower bound: 1800000000; overhead: 100%\n";
         if (output.str() != expected_output)

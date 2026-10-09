@@ -1,12 +1,11 @@
-// Energy-first scheduler for the supplied eight-core simulator.
 #include "scheduler.hpp"
 #include "ready_queue.hpp"
+#include "idle_predictor.hpp"
 
 #include <array>
 #include <iomanip>
 #include <unordered_map>
 
-// Compile-time controls allow paired benchmarks without changing the workload.
 #ifndef EEC_SMALL_CORES
 #define EEC_SMALL_CORES 4 // Number of small cores (IDs 4-7) enabled for work.
 #endif
@@ -14,28 +13,18 @@
 #define EEC_BIG_CORES 4 // Number of big cores (IDs 0-3) enabled for work.
 #endif
 #ifndef EEC_PSTATE
-#define EEC_PSTATE P3 // P-state used for normal execution.
+#define EEC_PSTATE P3
 #endif
-#ifndef EEC_TIMEOUT_QUANTA_2
-#define EEC_TIMEOUT_QUANTA_2 2 // C1 residence before entering C2.
-#endif
-#ifndef EEC_TIMEOUT_QUANTA_3
-#define EEC_TIMEOUT_QUANTA_3 3 // C2 residence before entering C3.
-#endif
-#ifndef EEC_TIMEOUT_QUANTA_4
-#define EEC_TIMEOUT_QUANTA_4 3 // C3 residence before entering C4.
-#endif
-#ifndef EEC_TIMEOUT_QUANTA_6
-#define EEC_TIMEOUT_QUANTA_6 4 // C4 residence before entering C6 (C5 is unused).
-#endif
+
+/*
+ *
+ * TODO: preemption policy, explicity compare edp cost of scheduling on low vs high core
+ */
 
 static_assert(EEC_SMALL_CORES >= 0 && EEC_SMALL_CORES <= 4, "Invalid small-core count");
 static_assert(EEC_BIG_CORES >= 0 && EEC_BIG_CORES <= 4, "Invalid big-core count");
 static_assert(EEC_SMALL_CORES + EEC_BIG_CORES > 0, "At least one core is needed");
 static_assert(EEC_PSTATE >= P0 && EEC_PSTATE <= P4, "Invalid P-state");
-static_assert(EEC_TIMEOUT_QUANTA_2 > 0 && EEC_TIMEOUT_QUANTA_3 > 0 &&
-              EEC_TIMEOUT_QUANTA_4 > 0 && EEC_TIMEOUT_QUANTA_6 > 0,
-              "Idle timeouts must be positive");
 
 namespace {
 enum class CoreStatus { Ready, Running, Sleeping, Waking, Deepening };
@@ -47,7 +36,7 @@ struct CoreRecord {
     bool enabled = false;
     CState_t c_state = C1;
     CState_t target_state = C1;
-    Time_t c_state_entered_at = 0;
+    IdlePredictor idle;
 };
 
 struct ProcessRecord {
@@ -69,95 +58,85 @@ std::uint64_t tail_changes = 0;
 Time_t total_wait = 0;
 Time_t maximum_wait = 0;
 
-// Inputs: core ID and current time. Output: none. Side effects: after the
-// current idle state's timeout, requests the next allowed C-state and updates
-// the core record; asynchronous C3->C4 and C4->C6 requests mark it Deepening.
-// Disabled cores request C6 immediately. Other core statuses are unchanged.
+// Input: A core ID and the current time.
+// Output: None.
+// Side-effects: Requests the predicted idle state for an eligible core.
 void SleepCore(CPUId_t core, Time_t now) {
     CoreRecord &record = cores[core];
     if (record.status != CoreStatus::Ready && record.status != CoreStatus::Sleeping)
         return;
     if (!record.enabled) {
         if (record.c_state != C6) {
+            record.target_state = C6;
+            record.status = record.c_state == C3 || record.c_state == C4
+                                ? CoreStatus::Deepening : CoreStatus::Sleeping;
             SetCState(core, C6);
-            record.c_state = C6;
-            record.status = CoreStatus::Sleeping;
+            if (record.status == CoreStatus::Sleeping)
+                record.c_state = C6;
         }
         return;
     }
 
-    CState_t next = record.c_state;
-    Time_t timeout = 0;
-    switch (record.c_state) {
-    case C1: next = C2; timeout = EEC_TIMEOUT_QUANTA_2; break;
-    case C2: next = C3; timeout = EEC_TIMEOUT_QUANTA_3; break;
-    case C3: next = C4; timeout = EEC_TIMEOUT_QUANTA_4; break;
-    case C4: next = C6; timeout = EEC_TIMEOUT_QUANTA_6; break;
-    default: return;
-    }
-    if (now - record.c_state_entered_at < timeout * QUANTUM)
+    // shortcut: no future-arrival getter exists; pass one here if the simulator exposes it.
+    const CState_t next = record.idle.Select(now);
+    if (next <= record.c_state)
         return;
     record.target_state = next;
-    // From C3 or C4, transition completes asynchronously. Core is "deepening" until callback arrives
     record.status = record.c_state == C3 || record.c_state == C4
                         ? CoreStatus::Deepening : CoreStatus::Sleeping;
     SetCState(core, next);
-    if (record.status == CoreStatus::Sleeping) {
+    if (record.status == CoreStatus::Sleeping)
         record.c_state = next;
-        record.c_state_entered_at = now;
-    }
 }
 
-// Inputs: none. Output: none. Postcondition: core ownership and enabled flags
-// are initialized once, leaving cores ready for the first scheduling pass.
+// Input: None.
+// Output: None.
+// Side-effects: On the first call, records which cores are enabled and
+// initializes their ownership and idle timestamps.
 void Initialize() {
     if (initialized)
         return;
     initialized = true;
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         cores[core].pid = InvalidProcessId();
-        cores[core].c_state_entered_at = Now();
-        // enable the core ids according to the simulator
+        cores[core].idle.Begin(Now());
         cores[core].enabled = static_cast<int>(core) < EEC_BIG_CORES ||
                               (core >= 4 && core < 4 + EEC_SMALL_CORES);
-        // Constructors establish C1. ScheduleReadyWork dispatches admitted
-        // work before putting unused cores into their configured idle states.
     }
 }
 
-// Inputs: core ID and remaining work. Output: selected P-state. Postcondition:
-// scheduler state is unchanged; a short final interval may select P4.
+// Input: A core ID and the process's remaining work.
+// Output: The P-state to use for that work.
+// Side-effects: None.
 PState_t StateForWork(CPUId_t core, Time_t remaining) {
-    // At a timer interrupt, P4 completes <=120 small-core work units
-    // (<=200 on a big core) in one quantum for less energy than P3.
-    // These thresholds come from libsim.so: CPU::BeforeScheduler applies
-    // speed[P4] * scale[core type] * elapsed, with P4 speed 0.20, big
-    // scale 1.0, and small scale 0.60. For QUANTUM=1000,
-    // that is 200 work units on a big core and 120 on a small core.
-    const Time_t p4_work_per_quantum = core >= 4 ? 120 : 200;
-    if (remaining > 0 && remaining <= p4_work_per_quantum)
-        return P4;
+    // libsim's big-core rates for P0 through P4 are 1000, 800, 600, 400,
+    // and 200 work units per quantum. Small cores run at 60% of those rates.
+    // Choose the slowest state that can finish the remaining work this quantum.
+    constexpr std::array<Time_t, 5> big_work_per_quantum = {1000, 800, 600, 400, 200};
+    if (remaining > 0) {
+        for (int state = P4; state >= P0; --state) {
+            const Time_t capacity = big_work_per_quantum[state] * (core >= 4 ? 3 : 5) / 5;
+            if (remaining <= capacity)
+                return static_cast<PState_t>(state);
+        }
+    }
     return EEC_PSTATE;
 }
 
-// Inputs: process ID, ready core ID, and current time. Output: none.
-// Postcondition: the process context runs on that core at its selected
-// P-state, and first-dispatch wait is recorded when applicable.
+// Input: A process ID, a core ID, and the current time.
+// Output: None.
+// Side-effects: Records the first dispatch wait, starts the process on the
+// core, and updates their state. Throws if the process or core is unavailable.
 void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
-    // Verify the target core is ready and not already assigned to a process.
     CoreRecord &record = cores[core];
     if (record.status != CoreStatus::Ready || record.pid != InvalidProcessId())
         ThrowException("Dispatch requires an unowned core in C1");
 
-    // Look up the process record and reject IDs that were never created.
     auto process_entry = processes.find(pid);
     if (process_entry == processes.end())
-        // unable to resolve pid in processes map
         ThrowException("Dispatch received an unknown process");
     ProcessRecord &process_record = process_entry->second;
 
-    // Count the process's ready-queue wait once, on its first dispatch.
-    // Keep track of total weight/max weight for metrics printed upon exit
     if (!process_record.dispatched) {
         const Time_t wait = now - process_record.arrival;
         total_wait += wait;
@@ -166,17 +145,15 @@ void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
         process_record.dispatched = true;
     }
 
-    // Choose a P-state based on the core type and the process's remaining work.
     const PState_t state = StateForWork(core, GetRemaining(pid));
 
-    // Load the saved process context, then start execution on the core.
     LoadContext(pid, core);
     RunCore(core);
     // RunCore resets the execution timestamp. No work is double-counted
     // when SetPState is applied immediately afterward at the same time.
 
-    // Apply the selected P-state and record the core's new ownership and state.
     SetPState(core, state);
+    record.idle.End(now);
     record.pid = pid;
     record.pstate = state;
     record.status = CoreStatus::Running;
@@ -184,46 +161,28 @@ void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
     process_record.core = core;
 }
 
-// Inputs: current time. Output: none. Postcondition: queued work is dispatched to
-// available enabled cores; additional required cores are requested awake, and
-// unused ready cores are put into their configured idle states.
+// Input: The current time.
+// Output: None.
+// Side-effects: Dispatches queued processes, requests core wakes when needed,
+// and moves idle cores toward sleep.
 void ScheduleReadyWork(Time_t now) {
-    // Prefer ready small cores before experimental big-core configurations.
     for (unsigned position = 0; position < cores.size(); ++position) {
-        // visits cores in this order as position goes from 0 to 7:
-        // 4, 5, 6, 7, 0, 1, 2, 3
-        // Small cores = 4, 5, 6, 7
-        const CPUId_t core = (position + 4) % cores.size();
+        const CPUId_t core = (position) % cores.size();
         CoreRecord &record = cores[core];
-        if (!ready.Empty() && record.enabled && record.status == CoreStatus::Sleeping &&
-            record.c_state == C2) {
-            SetCState(core, C1);
-            record.status = CoreStatus::Ready;
-            record.c_state = C1;
-            record.c_state_entered_at = now;
-        }
         if (!ready.Empty() && record.enabled && record.status == CoreStatus::Ready) {
-            std::optional<ProcessId_t> pid;
-            if (core < 4) {
-                // High-perf cores. There's no reason to schedule here if time remaining is <= 120
-                // (the amount of work a low-perf core can get done in one time quantum)
-                pid = ready.PopNext(121);
-            } else {
-                pid = ready.PopNext();
-            }
+            std::optional<ProcessId_t> pid = ready.PopNext();
             if (pid)
                 Dispatch(*pid, core, now);
         }
     }
 
-    // Are there any cores in the process of waking up?
     std::size_t waking = 0;
     for (const CoreRecord &record : cores)
         if (record.status == CoreStatus::Waking)
             ++waking;
 
     // Prefer shallower sleepers; count an in-flight wake as future capacity.
-    for (CState_t state : {C3, C4, C6}) {
+    for (CState_t state : {C4, C6}) {
         for (unsigned position = 0; position < cores.size() && waking < ready.Size(); ++position) {
             const CPUId_t core = (position + 4) % cores.size();
             CoreRecord &record = cores[core];
@@ -237,14 +196,15 @@ void ScheduleReadyWork(Time_t now) {
         }
     }
 
-    // Put unused (ready) cores to sleep
     for (CPUId_t core = 0; core < cores.size(); ++core)
         SleepCore(core, now);
 }
 } // namespace
 
-// Inputs: newly created process ID. Output: none. Postcondition: the process
-// is recorded, counted, queued, and scheduled if capacity is available.
+// Input: A new process ID.
+// Output: None.
+// Side-effects: Records and queues the process, updates creation totals, and
+// schedules work. Throws for invalid or duplicate creation.
 void CreateProcess(ProcessId_t pid) {
     Initialize();
     const Time_t work = GetRemaining(pid);
@@ -257,9 +217,10 @@ void CreateProcess(ProcessId_t pid) {
     ScheduleReadyWork(now);
 }
 
-// Inputs: completed process ID. Output: none. Postcondition: a validated
-// completed process is removed, its core is released, and queued work is
-// scheduled; invalid completion state raises an exception.
+// Input: A completed process ID.
+// Output: None.
+// Side-effects: Removes the process, frees its core, updates the completion
+// count, and schedules work. Throws if completion does not match a running process.
 void ExitProcess(ProcessId_t pid) {
     auto process = processes.find(pid);
     if (process == processes.end() || !process->second.core)
@@ -275,14 +236,15 @@ void ExitProcess(ProcessId_t pid) {
     cores[owner].pid = InvalidProcessId();
     cores[owner].status = CoreStatus::Ready;
     cores[owner].c_state = C1;
-    cores[owner].c_state_entered_at = Now();
+    cores[owner].idle.Begin(Now());
     ++completed;
     ScheduleReadyWork(Now());
 }
 
-// Inputs: timer timestamp.
-// Output: none. Postcondition: eligible running jobs use the appropriate
-// final-interval P-state, then ready work is scheduled.
+// Input: The current time.
+// Output: None.
+// Side-effects: Adjusts running cores' P-states when needed and schedules
+// ready work.
 void TimerInterrupt(Time_t now) {
     Initialize();
     for (CPUId_t core = 0; core < cores.size(); ++core) {
@@ -303,12 +265,14 @@ void TimerInterrupt(Time_t now) {
     ScheduleReadyWork(now);
 }
 
-// Complete either an idle deepening request or a wake request.
+// Input: The ID of the core whose sleep or wake transition finished.
+// Output: None.
+// Side-effects: Updates the core state, counts completed wakes, and schedules
+// work. Throws if the transition completion was unexpected.
 void CStateTransitionComplete(CPUId_t core) {
     if (core < cores.size() && cores[core].status == CoreStatus::Deepening) {
         cores[core].status = CoreStatus::Sleeping;
         cores[core].c_state = cores[core].target_state;
-        cores[core].c_state_entered_at = Now();
         ScheduleReadyWork(Now());
         return;
     }
@@ -316,16 +280,15 @@ void CStateTransitionComplete(CPUId_t core) {
         ThrowException("Unexpected C-state transition completion");
     cores[core].status = CoreStatus::Ready;
     cores[core].c_state = C1;
-    cores[core].c_state_entered_at = Now();
     ++wake_completions;
-    // Only dispatch queue entries here; other running cores may not yet have
-    // advanced through their BeforeScheduler calls for this timestamp.
+    // Other running cores may not have reached BeforeScheduler at this timestamp.
     ScheduleReadyWork(Now());
 }
 
-// Inputs: final simulation timestamp. Output: completion and energy metrics
-// on stdout. Postcondition: verifies all jobs and contexts are finished before
-// reporting; unfinished or owned work raises an exception.
+// Input: The final simulation time.
+// Output: None.
+// Side-effects: Checks that all work is done and prints run statistics. Throws
+// if work or core ownership remains.
 void SimulationComplete(Time_t now) {
     if (!ready.Empty() || !processes.empty() || created != completed)
         ThrowException("Simulation stopped with unfinished scheduler work");

@@ -5,7 +5,7 @@ CXXFLAGS := -std=gnu++17 -O2
 
 all: sim
 
-sim: scheduler.cpp ready_queue.cpp ready_queue.hpp libsim.so
+sim: scheduler.cpp idle_predictor.hpp ready_queue.cpp ready_queue.hpp libsim.so
 	$(CXX) $(CXXFLAGS) -o $@ scheduler.cpp ready_queue.cpp -L. -lsim -Wl,-rpath,'$$ORIGIN'
 
 run: sim

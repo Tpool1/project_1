@@ -2,3 +2,6 @@ sim
 /scheduler
 *.o
 a.out
+/docs/
+/tests/
+/timeout-grid.csv

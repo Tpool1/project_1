@@ -12,7 +12,7 @@
 #define EEC_SMALL_CORES 4 // Number of small cores (IDs 4-7) enabled for work.
 #endif
 #ifndef EEC_BIG_CORES
-#define EEC_BIG_CORES 4 // Number of big cores (IDs 0-3) enabled for work.
+#define EEC_BIG_CORES 3 // Number of big cores (IDs 0-2) enabled for work.
 #endif
 #ifndef EEC_PSTATE
 #define EEC_PSTATE P3
@@ -93,28 +93,10 @@ struct Projection {
     }
 };
 
-// P3 is the simulator's minimum-energy state for sustained work. These values
-// come from libsim's speed, scale, leakage, and dynamic-power tables.
-long double WorkRate(CPUId_t core) {
-    return core < 4 ? 0.4L : 0.24L;
-}
-
-long double RunningPower(CPUId_t core) {
-    return core < 4 ? 5.6L : 2.8L;
-}
-
 long double IdlePower(CPUId_t core) {
     // C4 power. It is a conservative middle ground for the predictor's C1/C4/C6
     // choices and is used equally by both counterfactual schedules.
     return core < 4 ? 1.6L : 0.8L;
-}
-
-long double WorkDuration(CPUId_t core, Time_t work) {
-    return std::ceil(static_cast<long double>(work) / WorkRate(core));
-}
-
-long double WorkEnergy(CPUId_t core, Time_t work) {
-    return WorkDuration(core, work) * RunningPower(core);
 }
 
 bool ReadyQueuesEmpty() {
@@ -184,17 +166,12 @@ void Initialize() {
 // Output: The P-state to use for that work.
 // Side-effects: None.
 PState_t StateForWork(CPUId_t core, Time_t remaining) {
-    // libsim's big-core rates for P0 through P4 are 1000, 800, 600, 400,
-    // and 200 work units per quantum. Small cores run at 60% of those rates.
-    // Choose the slowest state that can finish the remaining work this quantum.
-    constexpr std::array<Time_t, 5> big_work_per_quantum = {1000, 800, 600, 400, 200};
-    if (remaining > 0) {
-        for (int state = P4; state >= P0; --state) {
-            const Time_t capacity = big_work_per_quantum[state] * (core >= 4 ? 3 : 5) / 5;
-            if (remaining <= capacity)
-                return static_cast<PState_t>(state);
-        }
-    }
+    // P3 minimizes sustained-work energy in this simulator. Use P4 only when
+    // it can finish the job in the current interval; faster states save less
+    // than one quantum and cost more energy than that local delay can justify.
+    const Time_t p4_capacity = core < 4 ? 200 : 120;
+    if (remaining > 0 && remaining <= p4_capacity)
+        return P4;
     return EEC_PSTATE;
 }
 
@@ -214,23 +191,20 @@ Time_t StateCapacity(CPUId_t core, PState_t state) {
 }
 
 // Project the simulator's full-quantum execution policy: sustained work uses
-// EEC_PSTATE, then the final interval uses the slowest state that can finish it.
+// EEC_PSTATE and a final interval uses P4 only when P4 can finish it.
 JobProjection ProjectJob(CPUId_t core, Time_t work) {
     if (work <= 0)
         return {0, 0};
 
-    const Time_t maximum_final_capacity = StateCapacity(core, P0);
     const Time_t sustained_capacity = StateCapacity(core, EEC_PSTATE);
-    Time_t sustained_intervals = 0;
-    if (work > maximum_final_capacity) {
-        sustained_intervals =
-            (work - maximum_final_capacity + sustained_capacity - 1) / sustained_capacity;
-    }
+    const Time_t total_intervals =
+        (work + sustained_capacity - 1) / sustained_capacity;
+    const Time_t sustained_intervals = total_intervals - 1;
     const Time_t final_work = work - sustained_intervals * sustained_capacity;
     const PState_t final_state = StateForWork(core, final_work);
     const long double intervals = static_cast<long double>(sustained_intervals);
     return {
-        (intervals + 1.0L) * QUANTUM,
+        static_cast<long double>(total_intervals) * QUANTUM,
         intervals * StatePower(core, EEC_PSTATE) * QUANTUM +
             StatePower(core, final_state) * QUANTUM
     };
@@ -380,9 +354,9 @@ Projection ProjectRemainingWork(const std::optional<Preemption> &change) {
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         if (!cores[core].enabled || running[core] == invalid)
             continue;
-        const Time_t work = GetRemaining(running[core]);
-        available[core] = WorkDuration(core, work);
-        active_energy[core] = WorkEnergy(core, work);
+        const JobProjection job = ProjectJob(core, GetRemaining(running[core]));
+        available[core] = job.duration;
+        active_energy[core] = job.energy;
     }
 
     long double finish = 0;
@@ -515,7 +489,8 @@ void MaybePreempt(Time_t now) {
 // Side-effects: Dispatches queued processes, requests core wakes when needed,
 // and moves idle cores toward sleep.
 void ScheduleReadyWork(Time_t now) {
-    for (CPUId_t core = 0; core < cores.size(); ++core) {
+    for (unsigned position = 0; position < cores.size(); ++position) {
+        const CPUId_t core = (position + 4) % cores.size();
         CoreRecord &record = cores[core];
         if (record.enabled && record.status == CoreStatus::Ready && !ReadyQueuesEmpty())
             Dispatch(TakeGlobalLongest(core), core, now);

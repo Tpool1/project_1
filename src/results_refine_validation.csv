@@ -1,0 +1,3 @@
+small,big,small_idle,big_idle,small_first,initial_awake,small_p,big_p,policy,wake_threshold,time_h,energy_kwh,edp
+4,4,6,6,1,4,3,3,0,2,24.164722222,0.354552333,8.567658648
+4,4,6,6,1,4,3,3,0,2,24.164722222,0.354552333,8.567658648

@@ -12,10 +12,9 @@ For any questions, please post on Ed
 The scheduler runs jobs at P3, uses P4 for a final interval when it can
 finish at lower energy, and moves unused enabled cores through C1, C2, C3,
 C4, and C6 as their per-state idle timeouts expire. C5 is unused. Disabled
-cores enter C6 immediately. The deepest enabled idle state and the four
-timeout lengths can be set with `EEC_MAX_IDLE_C_STATE` and
+cores enter C6 immediately. The four timeout lengths can be set with
 `EEC_TIMEOUT_QUANTA_2`, `_3`, `_4`, and `_6` at compile time (defaults:
-3, 5, 5, and 10 quanta). It handles asynchronous wakes and checks that all jobs
+2, 3, 3, and 5 quanta). It handles asynchronous wakes and checks that all jobs
 have completed before reporting energy. See the [design plan](docs/energy-aware-scheduler-design.md)
 and [measured results](docs/scheduler-results.md).
 
@@ -24,6 +23,16 @@ paired generator seeds 0–5. The tests independently check context ownership,
 remaining-work accounting, completion counts, and idle state transitions.
 Run `make benchmark` to compare policy configurations.
 
+To rank idle timeout combinations by mean raw EDP across generator seeds 0–5,
+run `python3 tests/grid_search_timeouts.py` from the project root on Linux.
+The default grid tests every positive value through the current defaults:
+`1-2`, `1-3`, `1-3`, and `1-5` (90 combinations). Results are saved in
+`timeout-grid.csv`, sorted by mean EDP, with each seed's EDP included. Use
+`--q2`, `--q3`, `--q4`, and `--q6` to pass comma-separated values or inclusive
+ranges (for example, `--q2 1-4 --q6 3,5,8`); `--seeds 0-2` selects seeds and
+`--output path.csv` changes the CSV location. The script compiles each candidate
+with `-D` flags and does not edit `scheduler.cpp`.
+
 On an Apple Silicon Mac with the `gcc:13` container image installed, run:
 
 ```sh
@@ -31,6 +40,16 @@ docker run --rm --platform linux/amd64 --network none --read-only \
   --mount type=bind,source="$PWD",target=/work,readonly \
   --tmpfs /tmp:rw,exec,size=128m gcc:13 \
   make -C /work/src test
+```
+
+For the timeout search on a Mac, run this from the project root (the CSV is
+written to the project root):
+
+```sh
+docker run --rm --platform linux/amd64 --network none --read-only \
+  --mount type=bind,source="$PWD",target=/work \
+  --tmpfs /tmp:rw,exec,size=128m gcc:13 \
+  python3 /work/tests/grid_search_timeouts.py --output /work/timeout-grid.csv
 ```
 
 Energy uses the starter's display conversion; the design document explains

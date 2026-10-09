@@ -4,7 +4,6 @@
 
 #include <array>
 #include <iomanip>
-#include <optional>
 #include <unordered_map>
 
 // Compile-time controls allow paired benchmarks without changing the workload.
@@ -18,16 +17,16 @@
 #define EEC_PSTATE P3 // P-state used for normal execution.
 #endif
 #ifndef EEC_TIMEOUT_QUANTA_2
-#define EEC_TIMEOUT_QUANTA_2 3 // C1 residence before entering C2.
+#define EEC_TIMEOUT_QUANTA_2 2 // C1 residence before entering C2.
 #endif
 #ifndef EEC_TIMEOUT_QUANTA_3
-#define EEC_TIMEOUT_QUANTA_3 5 // C2 residence before entering C3.
+#define EEC_TIMEOUT_QUANTA_3 3 // C2 residence before entering C3.
 #endif
 #ifndef EEC_TIMEOUT_QUANTA_4
-#define EEC_TIMEOUT_QUANTA_4 5 // C3 residence before entering C4.
+#define EEC_TIMEOUT_QUANTA_4 3 // C3 residence before entering C4.
 #endif
 #ifndef EEC_TIMEOUT_QUANTA_6
-#define EEC_TIMEOUT_QUANTA_6 10 // C4 residence before entering C6 (C5 is unused).
+#define EEC_TIMEOUT_QUANTA_6 4 // C4 residence before entering C6 (C5 is unused).
 #endif
 
 static_assert(EEC_SMALL_CORES >= 0 && EEC_SMALL_CORES <= 4, "Invalid small-core count");

@@ -351,7 +351,7 @@ stateDiagram-v2
     Waking --> ReadyC1: CStateTransitionComplete
 ```
 
-`DeepIdle` includes an entry request whose completion is not separately reported. Do not infer that an unreported physical transition finished immediately. Use the measured model, retain the request time, and forbid conflicting requests during the predicted entry interval. Package C7 requires separate coordination of all eight records.
+For the supplied `libsim.so`, a C3→C4 or C4→C6 entry request completes after 10 timer ticks and calls `CStateTransitionComplete`, just like a deep-state wake to C1. The scheduler must distinguish an entry completion from a wake by its recorded pending transition. Do not issue a conflicting request during the entry interval. Package C7 requires separate coordination of all eight records.
 
 ### 7.1 Dispatch and removal sequences
 

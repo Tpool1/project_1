@@ -9,16 +9,20 @@ For any questions, please post on Ed
 
 ## Energy-first scheduler
 
-The scheduler runs jobs on up to four small cores at P3, uses P4 for a final
-interval when it can finish at lower energy, and puts unused cores in C6.
-It preserves FIFO order, handles asynchronous wakes, and checks that all jobs
+The scheduler runs jobs at P3, uses P4 for a final interval when it can
+finish at lower energy, and moves unused enabled cores through C1, C2, C3,
+C4, and C6 as their per-state idle timeouts expire. C5 is unused. Disabled
+cores enter C6 immediately. The deepest enabled idle state and the four
+timeout lengths can be set with `EEC_MAX_IDLE_C_STATE` and
+`EEC_TIMEOUT_QUANTA_2`, `_3`, `_4`, and `_6` at compile time (defaults:
+3, 5, 5, and 10 quanta). It handles asynchronous wakes and checks that all jobs
 have completed before reporting energy. See the [design plan](docs/energy-aware-scheduler-design.md)
 and [measured results](docs/scheduler-results.md).
 
 On a Linux lab machine, run `make test` from `src` for synthetic cases and
 paired generator seeds 0–5. The tests independently check context ownership,
-remaining-work accounting, completion counts, and the full-quantum energy
-minimum. Run `make benchmark` to compare 17 policy configurations.
+remaining-work accounting, completion counts, and idle state transitions.
+Run `make benchmark` to compare policy configurations.
 
 On an Apple Silicon Mac with the `gcc:13` container image installed, run:
 

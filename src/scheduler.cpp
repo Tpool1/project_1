@@ -7,45 +7,48 @@
 #include <optional>
 #include <unordered_map>
 
-/*
- * Ideas:
- * 1. Intelligently choose between big and small cores. Big cores for more work unit jobs, small cores otherwise
- * 3. Adaptive idle control instead of always going to C6 for sleep. Look into methods to predict job arrivals
- * 4. Adjust Pstate based on IO bound operations
- */
-
 // Compile-time controls allow paired benchmarks without changing the workload.
 #ifndef EEC_SMALL_CORES
 #define EEC_SMALL_CORES 4 // Number of small cores (IDs 4-7) enabled for work.
 #endif
 #ifndef EEC_BIG_CORES
-#define EEC_BIG_CORES 3 // Number of big cores (IDs 0-3) enabled for work.
+#define EEC_BIG_CORES 4 // Number of big cores (IDs 0-3) enabled for work.
 #endif
 #ifndef EEC_PSTATE
 #define EEC_PSTATE P3 // P-state used for normal execution.
 #endif
-#ifndef EEC_IDLE_STATE
-#define EEC_IDLE_STATE C4 // Idle C-state for enabled cores; disabled cores use C6.
+#ifndef EEC_TIMEOUT_QUANTA_2
+#define EEC_TIMEOUT_QUANTA_2 3 // C1 residence before entering C2.
 #endif
-#ifndef EEC_TAIL_DVFS
-#define EEC_TAIL_DVFS 1 // Enable P3-to-P4 switching when a job can finish in one quantum.
+#ifndef EEC_TIMEOUT_QUANTA_3
+#define EEC_TIMEOUT_QUANTA_3 5 // C2 residence before entering C3.
+#endif
+#ifndef EEC_TIMEOUT_QUANTA_4
+#define EEC_TIMEOUT_QUANTA_4 5 // C3 residence before entering C4.
+#endif
+#ifndef EEC_TIMEOUT_QUANTA_6
+#define EEC_TIMEOUT_QUANTA_6 10 // C4 residence before entering C6 (C5 is unused).
 #endif
 
 static_assert(EEC_SMALL_CORES >= 0 && EEC_SMALL_CORES <= 4, "Invalid small-core count");
 static_assert(EEC_BIG_CORES >= 0 && EEC_BIG_CORES <= 4, "Invalid big-core count");
 static_assert(EEC_SMALL_CORES + EEC_BIG_CORES > 0, "At least one core is needed");
 static_assert(EEC_PSTATE >= P0 && EEC_PSTATE <= P4, "Invalid P-state");
-static_assert(EEC_IDLE_STATE == C1 || EEC_IDLE_STATE == C4 || EEC_IDLE_STATE == C6,
-              "Supported idle states are C1, C4, and C6");
+static_assert(EEC_TIMEOUT_QUANTA_2 > 0 && EEC_TIMEOUT_QUANTA_3 > 0 &&
+              EEC_TIMEOUT_QUANTA_4 > 0 && EEC_TIMEOUT_QUANTA_6 > 0,
+              "Idle timeouts must be positive");
 
 namespace {
-enum class CoreStatus { Ready, Running, Sleeping, Waking };
+enum class CoreStatus { Ready, Running, Sleeping, Waking, Deepening };
 
 struct CoreRecord {
     CoreStatus status = CoreStatus::Ready;
     ProcessId_t pid = 0;
     PState_t pstate = P0;
     bool enabled = false;
+    CState_t c_state = C1;
+    CState_t target_state = C1;
+    Time_t c_state_entered_at = 0;
 };
 
 struct ProcessRecord {
@@ -67,16 +70,42 @@ std::uint64_t tail_changes = 0;
 Time_t total_wait = 0;
 Time_t maximum_wait = 0;
 
-// Inputs: core ID. Output: none. Postcondition: a ready core enters its
-// configured idle state (enabled) or C6 (disabled); other cores are unchanged.
-void SleepCore(CPUId_t core) {
+// Inputs: core ID and current time. Output: none. Side effects: after the
+// current idle state's timeout, requests the next allowed C-state and updates
+// the core record; asynchronous C3->C4 and C4->C6 requests mark it Deepening.
+// Disabled cores request C6 immediately. Other core statuses are unchanged.
+void SleepCore(CPUId_t core, Time_t now) {
     CoreRecord &record = cores[core];
-    if (record.status != CoreStatus::Ready)
+    if (record.status != CoreStatus::Ready && record.status != CoreStatus::Sleeping)
         return;
-    const CState_t state = record.enabled ? EEC_IDLE_STATE : C6;
-    if (state != C1) {
-        SetCState(core, state);
-        record.status = CoreStatus::Sleeping;
+    if (!record.enabled) {
+        if (record.c_state != C6) {
+            SetCState(core, C6);
+            record.c_state = C6;
+            record.status = CoreStatus::Sleeping;
+        }
+        return;
+    }
+
+    CState_t next = record.c_state;
+    Time_t timeout = 0;
+    switch (record.c_state) {
+    case C1: next = C2; timeout = EEC_TIMEOUT_QUANTA_2; break;
+    case C2: next = C3; timeout = EEC_TIMEOUT_QUANTA_3; break;
+    case C3: next = C4; timeout = EEC_TIMEOUT_QUANTA_4; break;
+    case C4: next = C6; timeout = EEC_TIMEOUT_QUANTA_6; break;
+    default: return;
+    }
+    if (now - record.c_state_entered_at < timeout * QUANTUM)
+        return;
+    record.target_state = next;
+    // From C3 or C4, transition completes asynchronously. Core is "deepening" until callback arrives
+    record.status = record.c_state == C3 || record.c_state == C4
+                        ? CoreStatus::Deepening : CoreStatus::Sleeping;
+    SetCState(core, next);
+    if (record.status == CoreStatus::Sleeping) {
+        record.c_state = next;
+        record.c_state_entered_at = now;
     }
 }
 
@@ -88,6 +117,7 @@ void Initialize() {
     initialized = true;
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         cores[core].pid = InvalidProcessId();
+        cores[core].c_state_entered_at = Now();
         // enable the core ids according to the simulator
         cores[core].enabled = static_cast<int>(core) < EEC_BIG_CORES ||
                               (core >= 4 && core < 4 + EEC_SMALL_CORES);
@@ -99,17 +129,15 @@ void Initialize() {
 // Inputs: core ID and remaining work. Output: selected P-state. Postcondition:
 // scheduler state is unchanged; a short final interval may select P4.
 PState_t StateForWork(CPUId_t core, Time_t remaining) {
-    if (EEC_TAIL_DVFS) {
-        // At a timer interrupt, P4 completes <=120 small-core work units
-        // (<=200 on a big core) in one quantum for less energy than P3.
-        // These thresholds come from libsim.so: CPU::BeforeScheduler applies
-        // speed[P4] * scale[core type] * elapsed, with P4 speed 0.20, big
-        // scale 1.0, and small scale 0.60. For QUANTUM=1000 (sim_types.h),
-        // that is 200 work units on a big core and 120 on a small core.
-        const Time_t p4_work_per_quantum = core >= 4 ? 120 : 200;
-        if (remaining > 0 && remaining <= p4_work_per_quantum)
-            return P4;
-    }
+    // At a timer interrupt, P4 completes <=120 small-core work units
+    // (<=200 on a big core) in one quantum for less energy than P3.
+    // These thresholds come from libsim.so: CPU::BeforeScheduler applies
+    // speed[P4] * scale[core type] * elapsed, with P4 speed 0.20, big
+    // scale 1.0, and small scale 0.60. For QUANTUM=1000,
+    // that is 200 work units on a big core and 120 on a small core.
+    const Time_t p4_work_per_quantum = core >= 4 ? 120 : 200;
+    if (remaining > 0 && remaining <= p4_work_per_quantum)
+        return P4;
     return EEC_PSTATE;
 }
 
@@ -153,6 +181,7 @@ void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now) {
     record.pid = pid;
     record.pstate = state;
     record.status = CoreStatus::Running;
+    record.c_state = C0;
     process_record.core = core;
 }
 
@@ -166,7 +195,15 @@ void ScheduleReadyWork(Time_t now) {
         // 4, 5, 6, 7, 0, 1, 2, 3
         // Small cores = 4, 5, 6, 7
         const CPUId_t core = (position + 4) % cores.size();
-        if (!ready.Empty() && cores[core].enabled && cores[core].status == CoreStatus::Ready) {
+        CoreRecord &record = cores[core];
+        if (!ready.Empty() && record.enabled && record.status == CoreStatus::Sleeping &&
+            record.c_state == C2) {
+            SetCState(core, C1);
+            record.status = CoreStatus::Ready;
+            record.c_state = C1;
+            record.c_state_entered_at = now;
+        }
+        if (!ready.Empty() && record.enabled && record.status == CoreStatus::Ready) {
             std::optional<ProcessId_t> pid;
             if (core < 4) {
                 // High-perf cores. There's no reason to schedule here if time remaining is <= 120
@@ -186,22 +223,24 @@ void ScheduleReadyWork(Time_t now) {
         if (record.status == CoreStatus::Waking)
             ++waking;
 
-    // while we are not out of cores to check and there are still more threads than ready cores
-    for (unsigned position = 0; position < cores.size() && waking < ready.Size(); ++position) {
-        const CPUId_t core = (position + 4) % cores.size();
-        if (cores[core].enabled && cores[core].status == CoreStatus::Sleeping) {
-            // A waking core is counted as future capacity. Never reissue this
-            // request: the simulator would restart its transition countdown.
-            cores[core].status = CoreStatus::Waking;
-            ++wake_requests;
-            SetCState(core, C1);
-            ++waking; // count moving from C6 (idle) to C1 as waking up
+    // Prefer shallower sleepers; count an in-flight wake as future capacity.
+    for (CState_t state : {C3, C4, C6}) {
+        for (unsigned position = 0; position < cores.size() && waking < ready.Size(); ++position) {
+            const CPUId_t core = (position + 4) % cores.size();
+            CoreRecord &record = cores[core];
+            if (record.enabled && record.status == CoreStatus::Sleeping &&
+                record.c_state == state) {
+                record.status = CoreStatus::Waking;
+                ++wake_requests;
+                SetCState(core, C1);
+                ++waking;
+            }
         }
     }
 
     // Put unused (ready) cores to sleep
     for (CPUId_t core = 0; core < cores.size(); ++core)
-        SleepCore(core);
+        SleepCore(core, now);
 }
 } // namespace
 
@@ -236,6 +275,8 @@ void ExitProcess(ProcessId_t pid) {
     // SaveContext here would incorrectly require a still-running C0 core.
     cores[owner].pid = InvalidProcessId();
     cores[owner].status = CoreStatus::Ready;
+    cores[owner].c_state = C1;
+    cores[owner].c_state_entered_at = Now();
     ++completed;
     ScheduleReadyWork(Now());
 }
@@ -245,32 +286,38 @@ void ExitProcess(ProcessId_t pid) {
 // final-interval P-state, then ready work is scheduled.
 void TimerInterrupt(Time_t now) {
     Initialize();
-    if (EEC_TAIL_DVFS) {
-        for (CPUId_t core = 0; core < cores.size(); ++core) {
-            CoreRecord &record = cores[core];
-            if (record.status != CoreStatus::Running)
-                continue;
-            const PState_t state = StateForWork(core, GetRemaining(record.pid));
-            if (state != record.pstate) {
-                // Reset the run timestamp so SetPState won't account this quantum twice.
-                SaveContext(record.pid, core);
-                LoadContext(record.pid, core);
-                RunCore(core);
-                SetPState(core, state);
-                record.pstate = state;
-                ++tail_changes;
-            }
+    for (CPUId_t core = 0; core < cores.size(); ++core) {
+        CoreRecord &record = cores[core];
+        if (record.status != CoreStatus::Running)
+            continue;
+        const PState_t state = StateForWork(core, GetRemaining(record.pid));
+        if (state != record.pstate) {
+            // Reset the run timestamp so SetPState won't account this quantum twice.
+            SaveContext(record.pid, core);
+            LoadContext(record.pid, core);
+            RunCore(core);
+            SetPState(core, state);
+            record.pstate = state;
+            ++tail_changes;
         }
     }
     ScheduleReadyWork(now);
 }
 
-// Inputs: core ID whose wake transition completed. Output: none. Postcondition:
-// the validated waking core becomes ready and queued work is rescheduled.
+// Complete either an idle deepening request or a wake request.
 void CStateTransitionComplete(CPUId_t core) {
+    if (core < cores.size() && cores[core].status == CoreStatus::Deepening) {
+        cores[core].status = CoreStatus::Sleeping;
+        cores[core].c_state = cores[core].target_state;
+        cores[core].c_state_entered_at = Now();
+        ScheduleReadyWork(Now());
+        return;
+    }
     if (core >= cores.size() || cores[core].status != CoreStatus::Waking)
         ThrowException("Unexpected C-state transition completion");
     cores[core].status = CoreStatus::Ready;
+    cores[core].c_state = C1;
+    cores[core].c_state_entered_at = Now();
     ++wake_completions;
     // Only dispatch queue entries here; other running cores may not yet have
     // advanced through their BeforeScheduler calls for this timestamp.

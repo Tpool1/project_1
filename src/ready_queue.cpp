@@ -7,9 +7,9 @@
 
 void ReadyQueue::Enqueue(ProcessId_t pid) {
     const Time_t remaining = GetRemaining(pid);
-    // Queue processes with less time remaining higher in the queue
+    // Queue processes with MOST time remaining higher in the queue
     const auto position = std::find_if(processes.begin(), processes.end(), [remaining](ProcessId_t queued_pid) {
-        return GetRemaining(queued_pid) > remaining;
+        return GetRemaining(queued_pid) < remaining;
     });
     processes.insert(position, pid);
 }

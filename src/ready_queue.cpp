@@ -36,6 +36,14 @@ std::optional<ProcessId_t> ReadyQueue::PopNext(Time_t minimum_remaining) {
     return pid;
 }
 
+ProcessId_t ReadyQueue::Remove(ProcessId_t pid) {
+    const auto position = std::find(processes.begin(), processes.end(), pid);
+    if (position == processes.end())
+        throw std::out_of_range("Cannot remove a process that is not queued");
+    processes.erase(position);
+    return pid;
+}
+
 bool ReadyQueue::Empty() const {
     return processes.empty();
 }

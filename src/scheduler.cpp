@@ -7,21 +7,43 @@
 #include <iomanip>
 #include <limits>
 #include <unordered_map>
+#include <utility>
 
 #ifndef EEC_SMALL_CORES
 #define EEC_SMALL_CORES 4 // Number of small cores (IDs 4-7) enabled for work.
 #endif
 #ifndef EEC_BIG_CORES
-#define EEC_BIG_CORES 3 // Number of big cores (IDs 0-2) enabled for work.
+#define EEC_BIG_CORES 4 // Number of big cores (IDs 0-3) enabled for work.
 #endif
 #ifndef EEC_PSTATE
 #define EEC_PSTATE P3
 #endif
 #ifndef EEC_PREEMPTION
-#define EEC_PREEMPTION 1
+#define EEC_PREEMPTION 0 // Experimental; measured gain was below 0.1%.
 #endif
 #ifndef EEC_PREEMPTION_QUIET
 #define EEC_PREEMPTION_QUIET 2000000
+#endif
+#ifndef EEC_IDLE_PREDICTOR
+#define EEC_IDLE_PREDICTOR 0
+#endif
+#ifndef EEC_EDP_PLACEMENT
+#define EEC_EDP_PLACEMENT 1
+#endif
+#ifndef EEC_DISPATCH_POLICY
+#define EEC_DISPATCH_POLICY 2 // 0: reserved, 1: EDP, 2: LJF, 3: SJF, 4: FIFO.
+#endif
+#ifndef EEC_FINAL_DVFS
+#define EEC_FINAL_DVFS 0 // Experimental; measured gain was below 0.1%.
+#endif
+#ifndef EEC_FINAL_DVFS_QUIET
+#define EEC_FINAL_DVFS_QUIET 2000000
+#endif
+#ifndef EEC_TAIL_P4
+#define EEC_TAIL_P4 1
+#endif
+#ifndef EEC_SMALL_FIRST
+#define EEC_SMALL_FIRST 1
 #endif
 
 static_assert(EEC_SMALL_CORES >= 0 && EEC_SMALL_CORES <= 4, "Invalid small-core count");
@@ -31,6 +53,19 @@ static_assert(EEC_PSTATE >= P0 && EEC_PSTATE <= P4, "Invalid P-state");
 static_assert(EEC_PREEMPTION == 0 || EEC_PREEMPTION == 1,
               "EEC_PREEMPTION must be zero or one");
 static_assert(EEC_PREEMPTION_QUIET >= 0, "Invalid preemption quiet period");
+static_assert(EEC_IDLE_PREDICTOR == 0 || EEC_IDLE_PREDICTOR == 1,
+              "EEC_IDLE_PREDICTOR must be zero or one");
+static_assert(EEC_EDP_PLACEMENT == 0 || EEC_EDP_PLACEMENT == 1,
+              "EEC_EDP_PLACEMENT must be zero or one");
+static_assert(EEC_DISPATCH_POLICY >= 0 && EEC_DISPATCH_POLICY <= 4,
+              "EEC_DISPATCH_POLICY must be between zero and four");
+static_assert(EEC_FINAL_DVFS == 0 || EEC_FINAL_DVFS == 1,
+              "EEC_FINAL_DVFS must be zero or one");
+static_assert(EEC_FINAL_DVFS_QUIET >= 0, "Invalid final-DVFS quiet period");
+static_assert(EEC_TAIL_P4 == 0 || EEC_TAIL_P4 == 1,
+              "EEC_TAIL_P4 must be zero or one");
+static_assert(EEC_SMALL_FIRST == 0 || EEC_SMALL_FIRST == 1,
+              "EEC_SMALL_FIRST must be zero or one");
 
 namespace {
 enum class CoreStatus { Ready, Running, Sleeping, Waking, Deepening };
@@ -64,6 +99,7 @@ std::uint64_t initial_work = 0;
 std::uint64_t wake_requests = 0;
 std::uint64_t wake_completions = 0;
 std::uint64_t tail_changes = 0;
+std::uint64_t final_dvfs_changes = 0;
 std::uint64_t preemptions = 0;
 std::uint64_t accelerations = 0;
 std::uint64_t consolidations = 0;
@@ -93,10 +129,17 @@ struct Projection {
     }
 };
 
-long double IdlePower(CPUId_t core) {
-    // C4 power. It is a conservative middle ground for the predictor's C1/C4/C6
-    // choices and is used equally by both counterfactual schedules.
-    return core < 4 ? 1.6L : 0.8L;
+struct ReservationChange {
+    std::optional<CPUId_t> source;
+    CPUId_t destination;
+    ProcessId_t pid;
+};
+
+long double IdlePower(CPUId_t core, CState_t state) {
+    constexpr std::array<long double, 8> big_power = {
+        0.0L, 9.6L, 9.6L, 4.0L, 1.6L, 0.0L, 0.0L, 0.0L
+    };
+    return big_power[state] * (core < 4 ? 1.0L : 0.5L);
 }
 
 bool ReadyQueuesEmpty() {
@@ -106,11 +149,8 @@ bool ReadyQueuesEmpty() {
     return true;
 }
 
-std::size_t ReadyQueueSize() {
-    std::size_t size = 0;
-    for (const ReadyQueue &queue : ready)
-        size += queue.Size();
-    return size;
+CPUId_t CoreAt(unsigned position) {
+    return EEC_SMALL_FIRST ? (position + 4) % cores.size() : position;
 }
 
 // Input: A core ID and the current time.
@@ -134,8 +174,10 @@ void SleepCore(CPUId_t core, Time_t now) {
         return;
     }
 
-    // shortcut: no future-arrival getter exists; pass one here if the simulator exposes it.
-    const CState_t next = record.idle.Select(now);
+    // C6 has zero residence power in the supplied simulator. The optional
+    // predictor remains available for controlled comparisons, but immediate
+    // C6 is the EDP-minimizing default measured across generator seeds.
+    const CState_t next = EEC_IDLE_PREDICTOR ? record.idle.Select(now) : C6;
     if (next <= record.c_state)
         return;
     record.target_state = next;
@@ -165,14 +207,15 @@ void Initialize() {
 // Input: A core ID and the process's remaining work.
 // Output: The P-state to use for that work.
 // Side-effects: None.
-PState_t StateForWork(CPUId_t core, Time_t remaining) {
+PState_t StateForWork(CPUId_t core, Time_t remaining,
+                      PState_t sustained_state = EEC_PSTATE) {
     // P3 minimizes sustained-work energy in this simulator. Use P4 only when
     // it can finish the job in the current interval; faster states save less
     // than one quantum and cost more energy than that local delay can justify.
     const Time_t p4_capacity = core < 4 ? 200 : 120;
-    if (remaining > 0 && remaining <= p4_capacity)
+    if (EEC_TAIL_P4 && remaining > 0 && remaining <= p4_capacity)
         return P4;
-    return EEC_PSTATE;
+    return sustained_state;
 }
 
 struct JobProjection {
@@ -192,20 +235,21 @@ Time_t StateCapacity(CPUId_t core, PState_t state) {
 
 // Project the simulator's full-quantum execution policy: sustained work uses
 // EEC_PSTATE and a final interval uses P4 only when P4 can finish it.
-JobProjection ProjectJob(CPUId_t core, Time_t work) {
+JobProjection ProjectJob(CPUId_t core, Time_t work,
+                         PState_t sustained_state = EEC_PSTATE) {
     if (work <= 0)
         return {0, 0};
 
-    const Time_t sustained_capacity = StateCapacity(core, EEC_PSTATE);
+    const Time_t sustained_capacity = StateCapacity(core, sustained_state);
     const Time_t total_intervals =
         (work + sustained_capacity - 1) / sustained_capacity;
     const Time_t sustained_intervals = total_intervals - 1;
     const Time_t final_work = work - sustained_intervals * sustained_capacity;
-    const PState_t final_state = StateForWork(core, final_work);
+    const PState_t final_state = StateForWork(core, final_work, sustained_state);
     const long double intervals = static_cast<long double>(sustained_intervals);
     return {
         static_cast<long double>(total_intervals) * QUANTUM,
-        intervals * StatePower(core, EEC_PSTATE) * QUANTUM +
+        intervals * StatePower(core, sustained_state) * QUANTUM +
             StatePower(core, final_state) * QUANTUM
     };
 }
@@ -226,26 +270,91 @@ Time_t WakeDelay(const CoreRecord &record, Time_t now) {
     return 0;
 }
 
-long double ProjectedCoreFinish(ProcessId_t pid, CPUId_t core, Time_t now) {
-    long double finish = queued_duration[core];
-    if (cores[core].status == CoreStatus::Running) {
-        finish += ProjectJob(core, GetRemaining(cores[core].pid)).duration;
-    } else if (!ready[core].Empty() || cores[core].status != CoreStatus::Ready) {
-        finish += WakeDelay(cores[core], now);
+// Project all currently admitted work. Reservation changes are evaluated using
+// the destination core's duration and energy, so a queue steal cannot retain
+// stale accounting from its original core.
+Projection ProjectSchedule(
+    Time_t now,
+    const std::optional<ReservationChange> &reservation_change = std::nullopt,
+    const std::optional<std::pair<CPUId_t, PState_t>> &state_change = std::nullopt,
+    const std::optional<Preemption> &migration = std::nullopt) {
+    std::array<long double, 8> duration = queued_duration;
+    std::array<long double, 8> energy = queued_energy;
+
+    if (reservation_change) {
+        if (reservation_change->source) {
+            const CPUId_t source = *reservation_change->source;
+            const JobProjection source_job =
+                ProjectJob(source, GetRemaining(reservation_change->pid));
+            duration[source] -= source_job.duration;
+            energy[source] -= source_job.energy;
+        }
+        const CPUId_t destination = reservation_change->destination;
+        const JobProjection destination_job =
+            ProjectJob(destination, GetRemaining(reservation_change->pid));
+        duration[destination] += destination_job.duration;
+        energy[destination] += destination_job.energy;
     }
-    return finish + ProjectJob(core, GetRemaining(pid)).duration;
+
+    const ProcessId_t invalid = InvalidProcessId();
+    std::array<ProcessId_t, 8> running;
+    running.fill(invalid);
+    for (CPUId_t core = 0; core < cores.size(); ++core)
+        if (cores[core].enabled && cores[core].status == CoreStatus::Running)
+            running[core] = cores[core].pid;
+
+    if (migration) {
+        running[migration->destination] = running[migration->source];
+        running[migration->source] = invalid;
+    }
+
+    long double finish = 0;
+    long double total_energy = 0;
+    for (CPUId_t core = 0; core < cores.size(); ++core) {
+        if (!cores[core].enabled)
+            continue;
+
+        if (running[core] != invalid) {
+            PState_t state = cores[core].pstate;
+            if (migration && migration->destination == core)
+                state = EEC_PSTATE;
+            if (state_change && state_change->first == core)
+                state = state_change->second;
+            const JobProjection running_job =
+                ProjectJob(core, GetRemaining(running[core]), state);
+            duration[core] += running_job.duration;
+            energy[core] += running_job.energy;
+        } else if (duration[core] > 0) {
+            const Time_t delay = WakeDelay(cores[core], now);
+            duration[core] += delay;
+            energy[core] += static_cast<long double>(delay) *
+                            IdlePower(core, cores[core].c_state);
+        }
+
+        finish = std::max(finish, duration[core]);
+        total_energy += energy[core];
+    }
+    return {total_energy, finish};
 }
 
 CPUId_t SelectQueue(ProcessId_t pid, Time_t now) {
     CPUId_t best = cores.size();
-    long double best_finish = std::numeric_limits<long double>::infinity();
+    long double best_score = std::numeric_limits<long double>::infinity();
+    long double best_energy = std::numeric_limits<long double>::infinity();
+    const long double energy_so_far = GetTotalEnergyConsumed();
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         if (!cores[core].enabled)
             continue;
-        const long double finish = ProjectedCoreFinish(pid, core, now);
-        if (finish < best_finish) {
+        const ReservationChange addition{std::nullopt, core, pid};
+        const Projection projected = ProjectSchedule(now, addition);
+        const long double score = EEC_EDP_PLACEMENT
+                                      ? projected.EDP(energy_so_far, now)
+                                      : projected.finish;
+        if (score < best_score ||
+            (score == best_score && projected.energy < best_energy)) {
             best = core;
-            best_finish = finish;
+            best_score = score;
+            best_energy = projected.energy;
         }
     }
     if (best == cores.size())
@@ -272,26 +381,68 @@ ProcessId_t DequeueForCore(CPUId_t core) {
     return pid;
 }
 
-// Preserve global LJF at dispatch time while retaining per-core reservations.
-// A ready core may correct an obsolete arrival-time projection by taking the
-// longest head job from another core's queue.
-ProcessId_t TakeGlobalLongest(CPUId_t destination) {
-    std::optional<CPUId_t> source;
-    Time_t longest = -1;
-    for (CPUId_t core = 0; core < cores.size(); ++core) {
-        if (ready[core].Empty())
+ProcessId_t RemoveFromCore(CPUId_t core, ProcessId_t pid) {
+    ready[core].Remove(pid);
+    const JobProjection job = ProjectJob(core, GetRemaining(pid));
+    queued_duration[core] -= job.duration;
+    queued_energy[core] -= job.energy;
+    return pid;
+}
+
+// Select work for an actually ready destination. Every cross-queue dispatch is
+// scored using that destination and removed from its original reservation, so
+// projected duration and energy cannot silently retain the source core's cost.
+std::optional<ProcessId_t> TakeForCore(CPUId_t destination, Time_t now) {
+    if (EEC_DISPATCH_POLICY == 0) {
+        if (ready[destination].Empty())
+            return std::nullopt;
+        return DequeueForCore(destination);
+    }
+
+    const long double energy_so_far = GetTotalEnergyConsumed();
+    const Projection baseline = ProjectSchedule(now);
+    long double best_score = std::numeric_limits<long double>::infinity();
+    std::optional<CPUId_t> best_source;
+    ProcessId_t best_pid = InvalidProcessId();
+
+    for (CPUId_t source = 0; source < cores.size(); ++source) {
+        if (ready[source].Empty())
             continue;
-        const Time_t remaining = GetRemaining(ready[core].Items().front());
-        if (!source || remaining > longest) {
-            source = core;
-            longest = remaining;
+        const std::deque<ProcessId_t> &items = ready[source].Items();
+        const std::size_t candidates = EEC_DISPATCH_POLICY == 4 ? items.size() : 1;
+        for (std::size_t index = 0; index < candidates; ++index) {
+            const ProcessId_t pid = EEC_DISPATCH_POLICY == 3
+                                        ? items.back()
+                                        : items[index];
+            long double score = 0;
+            if (EEC_DISPATCH_POLICY == 2) {
+                score = -static_cast<long double>(GetRemaining(pid));
+            } else if (EEC_DISPATCH_POLICY == 3) {
+                score = static_cast<long double>(GetRemaining(pid));
+            } else if (EEC_DISPATCH_POLICY == 4) {
+                score = static_cast<long double>(processes.at(pid).arrival);
+            } else if (source == destination) {
+                score = baseline.EDP(energy_so_far, now);
+            } else {
+                const ReservationChange move{source, destination, pid};
+                score = ProjectSchedule(now, move).EDP(energy_so_far, now);
+            }
+            if (score < best_score) {
+                best_score = score;
+                best_source = source;
+                best_pid = pid;
+            }
         }
     }
-    if (!source)
-        ThrowException("No queued process is available for dispatch");
-    if (*source != destination)
+
+    if (!best_source)
+        return std::nullopt;
+    const ProcessId_t moved = RemoveFromCore(*best_source, best_pid);
+    if (moved != best_pid)
+        ThrowException("Reservation changed during dispatch selection");
+    if (*best_source != destination)
         ++queue_steals;
-    return DequeueForCore(*source);
+    return moved;
 }
 
 // Input: A process ID, a core ID, and the current time.
@@ -331,47 +482,6 @@ void Dispatch(ProcessId_t pid, CPUId_t core, Time_t now, bool ended_idle_period 
     record.status = CoreStatus::Running;
     record.c_state = C0;
     process_record.core = core;
-}
-
-// Input: An optional placement change for the current runnable workload.
-// Output: Projected energy from now until completion and projected duration.
-// Side-effects: None. Future arrivals are deliberately excluded.
-Projection ProjectRemainingWork(const std::optional<Preemption> &change) {
-    const ProcessId_t invalid = InvalidProcessId();
-    std::array<ProcessId_t, 8> running;
-    running.fill(invalid);
-    for (CPUId_t core = 0; core < cores.size(); ++core)
-        if (cores[core].enabled && cores[core].status == CoreStatus::Running)
-            running[core] = cores[core].pid;
-
-    if (change) {
-        running[change->destination] = running[change->source];
-        running[change->source] = invalid;
-    }
-
-    std::array<long double, 8> available{};
-    std::array<long double, 8> active_energy{};
-    for (CPUId_t core = 0; core < cores.size(); ++core) {
-        if (!cores[core].enabled || running[core] == invalid)
-            continue;
-        const JobProjection job = ProjectJob(core, GetRemaining(running[core]));
-        available[core] = job.duration;
-        active_energy[core] = job.energy;
-    }
-
-    long double finish = 0;
-    for (CPUId_t core = 0; core < cores.size(); ++core)
-        if (cores[core].enabled)
-            finish = std::max(finish, available[core]);
-
-    long double energy = 0;
-    for (CPUId_t core = 0; core < cores.size(); ++core) {
-        if (!cores[core].enabled)
-            continue;
-        energy += active_energy[core];
-        energy += (finish - available[core]) * IdlePower(core);
-    }
-    return {energy, finish};
 }
 
 // Input: A running core.
@@ -432,7 +542,7 @@ void MaybePreempt(Time_t now) {
     if (!ReadyQueuesEmpty())
         return;
 
-    const Projection baseline = ProjectRemainingWork(std::nullopt);
+    const Projection baseline = ProjectSchedule(now);
     const long double energy_so_far = GetTotalEnergyConsumed();
     const long double baseline_edp = baseline.EDP(energy_so_far, now);
     std::optional<Preemption> best;
@@ -450,7 +560,8 @@ void MaybePreempt(Time_t now) {
                 continue;
             const Preemption candidate{PreemptionKind::Accelerate, small, big,
                                        cores[small].pid};
-            const Projection changed = ProjectRemainingWork(candidate);
+            const Projection changed =
+                ProjectSchedule(now, std::nullopt, std::nullopt, candidate);
             const long double changed_edp = changed.EDP(energy_so_far, now);
             if (changed.finish + 2 * QUANTUM <= baseline.finish && changed_edp < best_edp) {
                 best = candidate;
@@ -470,7 +581,8 @@ void MaybePreempt(Time_t now) {
                 continue;
             const Preemption candidate{PreemptionKind::Consolidate, big, small,
                                        cores[big].pid};
-            const Projection changed = ProjectRemainingWork(candidate);
+            const Projection changed =
+                ProjectSchedule(now, std::nullopt, std::nullopt, candidate);
             const long double changed_edp = changed.EDP(energy_so_far, now);
             if (changed.finish <= baseline.finish && changed.energy < baseline.energy &&
                 changed_edp < best_edp) {
@@ -484,42 +596,95 @@ void MaybePreempt(Time_t now) {
         ApplyPreemption(*best, now);
 }
 
+// Apply a P-state change without letting SetPState account the just-finished
+// timer interval a second time.
+void ChangeRunningState(CPUId_t core, PState_t state) {
+    CoreRecord &record = cores[core];
+    if (record.status != CoreStatus::Running || record.pid == InvalidProcessId())
+        ThrowException("P-state change requires a running core");
+    SaveContext(record.pid, core);
+    LoadContext(record.pid, core);
+    RunCore(core);
+    SetPState(core, state);
+    record.pstate = state;
+}
+
+// During the observed final drain, greedily apply one whole-system EDP-
+// improving P-state change per timer. Replanning each quantum lets later
+// changes account for energy already spent and the current longest tail.
+bool FinalDVFSEligible(Time_t now) {
+    return EEC_FINAL_DVFS && last_arrival >= 0 &&
+           now - last_arrival >= EEC_FINAL_DVFS_QUIET && ReadyQueuesEmpty();
+}
+
+void MaybeAdjustFinalDVFS(Time_t now) {
+    if (!FinalDVFSEligible(now))
+        return;
+
+    const long double energy_so_far = GetTotalEnergyConsumed();
+    const Projection baseline = ProjectSchedule(now);
+    long double best_edp = baseline.EDP(energy_so_far, now);
+    std::optional<CPUId_t> best_core;
+    PState_t best_state = EEC_PSTATE;
+
+    for (CPUId_t core = 0; core < cores.size(); ++core) {
+        const CoreRecord &record = cores[core];
+        if (!record.enabled || record.status != CoreStatus::Running ||
+            GetRemaining(record.pid) <= 0)
+            continue;
+        for (int raw_state = P0; raw_state <= P3; ++raw_state) {
+            const PState_t state = static_cast<PState_t>(raw_state);
+            if (state == record.pstate)
+                continue;
+            const Projection changed = ProjectSchedule(
+                now, std::nullopt, std::make_pair(core, state));
+            const long double changed_edp = changed.EDP(energy_so_far, now);
+            if (changed_edp < best_edp) {
+                best_edp = changed_edp;
+                best_core = core;
+                best_state = state;
+            }
+        }
+    }
+
+    if (best_core) {
+        ChangeRunningState(*best_core, best_state);
+        ++final_dvfs_changes;
+    }
+}
+
 // Input: The current time.
 // Output: None.
 // Side-effects: Dispatches queued processes, requests core wakes when needed,
 // and moves idle cores toward sleep.
 void ScheduleReadyWork(Time_t now) {
     for (unsigned position = 0; position < cores.size(); ++position) {
-        const CPUId_t core = (position + 4) % cores.size();
+        const CPUId_t core = CoreAt(position);
         CoreRecord &record = cores[core];
-        if (record.enabled && record.status == CoreStatus::Ready && !ReadyQueuesEmpty())
-            Dispatch(TakeGlobalLongest(core), core, now);
+        if (!record.enabled || record.status != CoreStatus::Ready)
+            continue;
+        const std::optional<ProcessId_t> pid = TakeForCore(core, now);
+        if (pid)
+            Dispatch(*pid, core, now);
     }
 
     MaybePreempt(now);
 
-    std::size_t waking = 0;
-    for (const CoreRecord &record : cores)
-        if (record.status == CoreStatus::Waking)
-            ++waking;
-
-    // Reservations influence projected load, while wake admission remains
-    // work-conserving: request enough capacity for the total queued demand.
-    for (CState_t state : {C4, C6}) {
-        for (unsigned position = 0;
-             position < cores.size() && waking < ReadyQueueSize(); ++position) {
-            const CPUId_t core = (position + 4) % cores.size();
-            CoreRecord &record = cores[core];
-            if (!record.enabled || record.status != CoreStatus::Sleeping ||
-                record.c_state != state)
-                continue;
-            record.idle.End(now);
-            record.status = CoreStatus::Waking;
-            record.wake_complete_at = now + (state == C6 ? 2000000 : 10000);
-            ++wake_requests;
-            ++waking;
-            SetCState(core, C1);
-        }
+    // Placement already compared the global EDP with this core's wake delay.
+    // A nonempty reservation therefore authorizes exactly this core's wake;
+    // empty cores are never woken merely because some other queue is long.
+    for (unsigned position = 0; position < cores.size(); ++position) {
+        const CPUId_t core = CoreAt(position);
+        CoreRecord &record = cores[core];
+        if (!record.enabled || record.status != CoreStatus::Sleeping ||
+            ready[core].Empty())
+            continue;
+        const Time_t delay = WakeDelay(record, now);
+        record.idle.End(now);
+        record.status = CoreStatus::Waking;
+        record.wake_complete_at = now + delay;
+        ++wake_requests;
+        SetCState(core, C1);
     }
 
     for (CPUId_t core = 0; core < cores.size(); ++core)
@@ -574,21 +739,20 @@ void ExitProcess(ProcessId_t pid) {
 // ready work.
 void TimerInterrupt(Time_t now) {
     Initialize();
+    const bool final_dvfs = FinalDVFSEligible(now);
     for (CPUId_t core = 0; core < cores.size(); ++core) {
         CoreRecord &record = cores[core];
         if (record.status != CoreStatus::Running)
             continue;
-        const PState_t state = StateForWork(core, GetRemaining(record.pid));
+        const PState_t sustained_state = final_dvfs ? record.pstate : EEC_PSTATE;
+        const PState_t state =
+            StateForWork(core, GetRemaining(record.pid), sustained_state);
         if (state != record.pstate) {
-            // Reset the run timestamp so SetPState won't account this quantum twice.
-            SaveContext(record.pid, core);
-            LoadContext(record.pid, core);
-            RunCore(core);
-            SetPState(core, state);
-            record.pstate = state;
+            ChangeRunningState(core, state);
             ++tail_changes;
         }
     }
+    MaybeAdjustFinalDVFS(now);
     ScheduleReadyWork(now);
 }
 
@@ -642,6 +806,7 @@ void SimulationComplete(Time_t now) {
               << (created ? static_cast<double>(total_wait) / created : 0.0)
               << '/' << maximum_wait << "; wakes: " << wake_completions << '/' << wake_requests
               << "; tail P-state changes: " << tail_changes
+              << "; final-DVFS changes: " << final_dvfs_changes
               << "; preemptions (accelerate/consolidate): " << preemptions
               << " (" << accelerations << '/' << consolidations << ")"
               << "; first/last: "

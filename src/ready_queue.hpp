@@ -12,6 +12,7 @@ public:
     void Enqueue(ProcessId_t pid);
     ProcessId_t PopNext();
     std::optional<ProcessId_t> PopNext(Time_t minimum_remaining);
+    ProcessId_t Remove(ProcessId_t pid);
     bool Empty() const;
     std::size_t Size() const;
     const std::deque<ProcessId_t> &Items() const;

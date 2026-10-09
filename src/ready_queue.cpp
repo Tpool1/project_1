@@ -43,3 +43,7 @@ bool ReadyQueue::Empty() const {
 std::size_t ReadyQueue::Size() const {
     return processes.size();
 }
+
+const std::deque<ProcessId_t> &ReadyQueue::Items() const {
+    return processes;
+}

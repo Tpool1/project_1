@@ -14,6 +14,7 @@ public:
     std::optional<ProcessId_t> PopNext(Time_t minimum_remaining);
     bool Empty() const;
     std::size_t Size() const;
+    const std::deque<ProcessId_t> &Items() const;
 
 private:
     std::deque<ProcessId_t> processes;

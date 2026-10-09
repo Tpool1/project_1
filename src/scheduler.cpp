@@ -315,10 +315,14 @@ void CStateTransitionComplete(CPUId_t core_id) {
 }
 
 void SimulationComplete(Time_t now) {
+    const double energy = GetTotalEnergyConsumed();
     std::cout << "Run stopped at "
               << FormatTime(now)
               << " after consuming "
-              << GetTotalEnergyConsumed() / 3600000000.0
+              << energy / 3600000000.0
               << " kWh"
+              << std::endl;
+    std::cout << "Energy-delay product: "
+              << energy * static_cast<double>(now)
               << std::endl;
 }
